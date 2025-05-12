@@ -1,0 +1,19 @@
+.container {
+  max-width: 800px;
+  margin: auto;
+  text-align: center;
+  font-family: sans-serif;
+}
+input {
+  width: 60%;
+  padding: 10px;
+  margin: 10px;
+}
+button {
+  padding: 10px 20px;
+}
+.stream {
+  margin-top: 20px;
+  max-width: 100%;
+  border: 2px solid #ccc;
+}
