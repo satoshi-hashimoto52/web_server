@@ -33,30 +33,25 @@ web_server/
 ---
 
 ## バックエンドの仕様（`backend/`）
-
-* `FastAPI` によるWebSocketエンドポイント `/ws/stream`
-* クライアントからカメラストリームURLを受信
-* OpenCVでフレーム読み込み
-* YOLOv8モデル（例: `7sgm_20250221.pt`）による物体検出
-* 検出結果付きのフレームをBase64エンコードし送信
-* デバイス: `torch.mps` が使える場合は M1 MacのGPUを使用
+- `FastAPI` によるWebSocketエンドポイント `/ws/stream`
+- クライアントからカメラストリームURLを受信
+- OpenCVでフレーム読み込み
+- YOLOv8モデル（例: `7sgm_20250221.pt`）による物体検出
+- 検出結果付きのフレームをBase64エンコードし送信
+- デバイス: `torch.mps` が使える場合は M1 MacのGPUを使用
 
 ### 必須パッケージ
-
-* `ultralytics`
-* `opencv-python`
-* `fastapi`
-* `uvicorn`
-* `torch`
+- `ultralytics`
+- `opencv-python`
+- `fastapi`
+- `uvicorn`
+- `torch`
 
 ### 起動方法
-
+サーバー起動（ポート 5050 で起動）
 ```bash
-cd web_server/backend
-source venv/bin/activate  # Mac/Linux
-# .\venv\Scripts\activate  # Windows
-
-# サーバー起動（ポート 5050 で起動）
+cd backend
+source venv/bin/activate
 uvicorn main:app --host 0.0.0.0 --port 5050
 ```
 
@@ -96,6 +91,8 @@ npm run dev
 
 ## 備考
 
-* YOLOv8 モデルは `backend/models/` に `.pt` ファイルとして配置
-* フレームレートは実測で約 20FPS（M1 Mac + MPS利用時）
-* 30FPS を目標とする場合は更なる最適化が必要（例: モデル軽量化、非同期推論）
+- YOLOv8 モデルは `backend/models/` に `.pt` ファイルとして配置
+- フレームレートは実測で約 20FPS（M1 Mac + MPS利用時）
+- 30FPS を目標とする場合は更なる最適化が必要（例: モデル軽量化、非同期推論）
+
+---
