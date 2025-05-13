@@ -1,5 +1,10 @@
 # Webカメラストリーミング物体検出アプリ 概要
 
+> GitHub : satoshi-hashimoto52 / web_server
+> ```
+> https://github.com/satoshi-hashimoto52/web_server
+> ```
+
 ## 構成概要
 
 本アプリケーションは、以下の2つのコンポーネントから構成される:
