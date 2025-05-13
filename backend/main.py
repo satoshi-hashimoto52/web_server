@@ -8,7 +8,7 @@ import base64
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from .detector import detect_objects  # detector.py から取り込み
+from detector import detect_objects  # detector.py から取り込み
 
 app = FastAPI()
 
