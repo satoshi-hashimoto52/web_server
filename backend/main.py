@@ -26,9 +26,18 @@ async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
     cap = None
     try:
-        # 最初のメッセージを「ストリーム URL」として受信
+        # 最初のメッセージを「ストリーム URL」または「デバイス指定」として受信
         stream_url = await websocket.receive_text()
-        cap = cv2.VideoCapture(stream_url)
+        if stream_url.startswith("device:"):
+            try:
+                device_index = int(stream_url.split(":", 1)[1])
+            except ValueError:
+                await websocket.send_text("ERROR: Invalid device index.")
+                await websocket.close()
+                return
+            cap = cv2.VideoCapture(device_index)
+        else:
+            cap = cv2.VideoCapture(stream_url)
         if not cap.isOpened():
             await websocket.send_text("ERROR: Unable to open stream.")
             await websocket.close()

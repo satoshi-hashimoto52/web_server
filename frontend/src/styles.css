@@ -1,19 +1,197 @@
+:root {
+  --bg: #0b0f1a;
+  --bg-soft: #151c2f;
+  --panel: #0f1526;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --text: #eef2ff;
+  --muted: rgba(238, 242, 255, 0.65);
+  --accent: #26d0ce;
+  --accent-2: #1a7fda;
+  --shadow: 0 24px 60px rgba(3, 5, 20, 0.45);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Space Grotesk", "JetBrains Mono", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at 15% 20%, rgba(38, 208, 206, 0.22), transparent 40%),
+    radial-gradient(circle at 80% 10%, rgba(26, 127, 218, 0.25), transparent 38%),
+    linear-gradient(140deg, #070a12 0%, #0b1120 45%, #0d1324 100%);
+  color: var(--text);
+}
+
 .container {
-  max-width: 800px;
-  margin: auto;
-  text-align: center;
-  font-family: sans-serif;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 48px 20px 64px;
 }
-input {
-  width: 60%;
-  padding: 10px;
-  margin: 10px;
+
+.hero {
+  text-align: left;
+  margin-bottom: 32px;
+  animation: fadeUp 0.8s ease both;
 }
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.4em;
+  font-size: 12px;
+  color: var(--accent);
+  margin: 0 0 12px;
+}
+
+h2 {
+  font-size: clamp(32px, 4vw, 52px);
+  margin: 0 0 12px;
+}
+
+.subhead {
+  max-width: 620px;
+  color: var(--muted);
+  margin: 0;
+  font-size: 16px;
+}
+
+.panel {
+  background: linear-gradient(135deg, rgba(20, 30, 60, 0.9), rgba(13, 20, 42, 0.95));
+  border: 1px solid var(--panel-border);
+  border-radius: 18px;
+  padding: 24px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(12px);
+  animation: fadeUp 0.9s ease both;
+  animation-delay: 0.1s;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 220px) 1fr minmax(180px, 220px);
+  gap: 16px;
+  align-items: end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.field span {
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.field-wide {
+  grid-column: 2 / 3;
+}
+
+input,
+select,
 button {
-  padding: 10px 20px;
+  font: inherit;
+  color: var(--text);
 }
+
+input,
+select {
+  background: var(--bg-soft);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 12px 14px;
+  border-radius: 12px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+input:focus,
+select:focus {
+  border-color: rgba(38, 208, 206, 0.6);
+  box-shadow: 0 0 0 3px rgba(38, 208, 206, 0.2);
+}
+
+select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 18px, calc(100% - 12px) 18px;
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+}
+
+.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border: none;
+  padding: 12px 18px;
+  border-radius: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 14px 30px rgba(26, 127, 218, 0.35);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 36px rgba(26, 127, 218, 0.45);
+}
+
+.preview {
+  margin-top: 28px;
+  padding: 12px;
+  border-radius: 18px;
+  background: rgba(10, 15, 30, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: var(--shadow);
+  animation: fadeUp 1s ease both;
+  animation-delay: 0.2s;
+  display: grid;
+  gap: 16px;
+}
+
 .stream {
-  margin-top: 20px;
-  max-width: 100%;
-  border: 2px solid #ccc;
+  width: 100%;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.secondary {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: var(--text);
+  padding: 10px 16px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.secondary:hover {
+  border-color: rgba(38, 208, 206, 0.6);
+  box-shadow: 0 10px 24px rgba(38, 208, 206, 0.2);
+  transform: translateY(-1px);
+}
+
+@media (max-width: 900px) {
+  .controls {
+    grid-template-columns: 1fr;
+  }
+
+  .field-wide {
+    grid-column: auto;
+  }
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
