@@ -6,6 +6,7 @@
 import cv2
 import base64
 import asyncio
+import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from detector import detect_objects  # detector.py から取り込み
@@ -25,9 +26,19 @@ app.add_middleware(
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
     cap = None
+    regions = []
     try:
         # 最初のメッセージを「ストリーム URL」または「デバイス指定」として受信
-        stream_url = await websocket.receive_text()
+        raw_message = await websocket.receive_text()
+        stream_url = raw_message
+        try:
+            payload = json.loads(raw_message)
+            if isinstance(payload, dict) and payload.get("type") == "start":
+                stream_url = payload.get("source", "")
+                regions = payload.get("regions", []) or []
+        except json.JSONDecodeError:
+            pass
+
         if stream_url.startswith("device:"):
             try:
                 device_index = int(stream_url.split(":", 1)[1])
@@ -49,14 +60,57 @@ async def websocket_stream(websocket: WebSocket):
             if not success:
                 break
 
+            # 領域更新の受信（あれば反映）
+            try:
+                update_message = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
+                try:
+                    update_payload = json.loads(update_message)
+                    if isinstance(update_payload, dict) and update_payload.get("type") == "regions":
+                        regions = update_payload.get("regions", []) or []
+                except json.JSONDecodeError:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+
             # 物体検出 + 描画
-            frame = detect_objects(frame)
+            frame, detections = detect_objects(frame)
+
+            # 領域ごとの検出結果（左から結合）
+            height, width = frame.shape[:2]
+            results_payload = []
+            for region in regions:
+                try:
+                    x = max(min(float(region.get("x", 0)), 100.0), 0.0)
+                    y = max(min(float(region.get("y", 0)), 100.0), 0.0)
+                    w = max(min(float(region.get("w", 0)), 100.0), 0.0)
+                    h = max(min(float(region.get("h", 0)), 100.0), 0.0)
+                except (TypeError, ValueError):
+                    continue
+                rx1 = int((x / 100.0) * width)
+                ry1 = int((y / 100.0) * height)
+                rx2 = int(((x + w) / 100.0) * width)
+                ry2 = int(((y + h) / 100.0) * height)
+                hits = []
+                for det in detections:
+                    cx = (det["x1"] + det["x2"]) / 2
+                    cy = (det["y1"] + det["y2"]) / 2
+                    if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                        hits.append((det["x1"], det.get("label", "")))
+                hits.sort(key=lambda item: item[0])
+                value = "".join([label for _, label in hits])
+                results_payload.append({
+                    "id": region.get("id"),
+                    "value": value,
+                })
 
             # JPEG エンコード → Base64
             _, buffer = cv2.imencode('.jpg', frame)
             jpg_b64 = base64.b64encode(buffer).decode('utf-8')
 
-            await websocket.send_text(jpg_b64)
+            await websocket.send_text(json.dumps({
+                "image": jpg_b64,
+                "results": results_payload,
+            }))
             await asyncio.sleep(0.03)  # ~30fps
 
         cap.release()

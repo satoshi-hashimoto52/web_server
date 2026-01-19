@@ -36,15 +36,25 @@ def detect_objects(frame):
     # 推論
     results = model(frame, device=device)[0]  # device を明示
     boxes = results.boxes
+    detections = []
 
     for box in boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
         label = f"{model.names[cls_id]} {conf:.2f}"
+        detections.append({
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "cls_id": cls_id,
+            "conf": conf,
+            "label": str(model.names[cls_id]),
+        })
         # バウンディングボックス
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         # ラベル
         cv2.putText(frame, label, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    return frame
+    return frame, detections
