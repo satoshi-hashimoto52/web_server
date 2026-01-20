@@ -16,6 +16,7 @@ function App() {
   const [regionValues, setRegionValues] = useState({});
   const [activeAction, setActiveAction] = useState(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [dragOverId, setDragOverId] = useState(null);
   const ws = useRef(null);
   const streamRef = useRef(null);
   const dragRef = useRef(null);
@@ -221,6 +222,20 @@ function App() {
         region.id === id ? { ...region, color } : region
       )
     );
+  };
+
+  const reorderRegions = (fromId, toId) => {
+    if (!fromId || !toId || fromId === toId) return;
+    setRegions((prev) => {
+      const fromIndex = prev.findIndex((region) => region.id === fromId);
+      const toIndex = prev.findIndex((region) => region.id === toId);
+      if (fromIndex === -1 || toIndex === -1) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+    setDragOverId(null);
   };
 
   useEffect(() => {
@@ -472,37 +487,81 @@ function App() {
             ) : (
               <ul>
                 {regions.map((region) => (
-                  <li key={region.id}>
-                    <input
-                      className="result-name-input"
-                      type="text"
-                      value={region.name}
-                      onChange={(event) => updateRegionName(region.id, event.target.value)}
-                    />
-                    <span className="result-count">
-                      {regionValues[region.id] ?? ''}
-                    </span>
-                    {/*
-                    <span className="result-meta">
-                      x:{Math.round(region.x)} y:{Math.round(region.y)}
-                      w:{Math.round(region.w)} h:{Math.round(region.h)}
-                    </span>
-                    */}
-                    <input
-                      className="result-color-input"
-                      type="color"
-                      value={region.color || '#ff3b3b'}
-                      onChange={(event) => updateRegionColor(region.id, event.target.value)}
-                      aria-label={`${region.name}の色を変更`}
-                    />
-                    <button
-                      className="icon-button"
-                      type="button"
-                      onClick={() => removeRegion(region.id)}
-                      aria-label={`${region.name}を削除`}
-                    >
-                      −
-                    </button>
+                  <li
+                    key={region.id}
+                    className={`result-item${dragOverId === `${region.id}:before` ? ' is-drop-before' : ''}${dragOverId === `${region.id}:after` ? ' is-drop-after' : ''}`}
+                    draggable
+                    onDragStart={(event) => {
+                      event.dataTransfer.effectAllowed = 'move';
+                      event.dataTransfer.setData('text/plain', region.id);
+                    }}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'move';
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const isAfter = event.clientY > rect.top + rect.height / 2;
+                      const nextId = `${region.id}:${isAfter ? 'after' : 'before'}`;
+                      if (dragOverId !== nextId) {
+                        setDragOverId(nextId);
+                      }
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const fromId = event.dataTransfer.getData('text/plain');
+                      const dropTarget = dragOverId || `${region.id}:after`;
+                      const [targetId, position] = dropTarget.split(':');
+                      if (!targetId) {
+                        reorderRegions(fromId, region.id);
+                        return;
+                      }
+                      setRegions((prev) => {
+                        const fromIndex = prev.findIndex((item) => item.id === fromId);
+                        const targetIndex = prev.findIndex((item) => item.id === targetId);
+                        if (fromIndex === -1 || targetIndex === -1) return prev;
+                        const next = [...prev];
+                        const [moved] = next.splice(fromIndex, 1);
+                        const insertIndex = position === 'before' ? targetIndex : targetIndex + 1;
+                        next.splice(insertIndex, 0, moved);
+                        return next;
+                      });
+                      setDragOverId(null);
+                    }}
+                    onDragLeave={() => setDragOverId(null)}
+                  >
+                    <div className="result-row">
+                      <input
+                        className="result-name-input"
+                        type="text"
+                        value={region.name}
+                        onChange={(event) => updateRegionName(region.id, event.target.value)}
+                      />
+                      <input
+                        className="result-color-input"
+                        type="color"
+                        value={region.color || '#ff3b3b'}
+                        onChange={(event) => updateRegionColor(region.id, event.target.value)}
+                        aria-label={`${region.name}の色を変更`}
+                      />
+                      <button
+                        className="icon-button"
+                        type="button"
+                        onClick={() => removeRegion(region.id)}
+                        aria-label={`${region.name}を削除`}
+                      >
+                        −
+                      </button>
+                    </div>
+                    <div className="result-value">
+                      <span className="result-count">
+                        {regionValues[region.id] ?? ''}
+                      </span>
+                      {/*
+                      <span className="result-meta">
+                        x:{Math.round(region.x)} y:{Math.round(region.y)}
+                        w:{Math.round(region.w)} h:{Math.round(region.h)}
+                      </span>
+                      */}
+                    </div>
                   </li>
                 ))}
               </ul>
