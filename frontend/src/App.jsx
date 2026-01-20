@@ -13,11 +13,38 @@ function App() {
   const [regions, setRegions] = useState([]);
   const [regionValues, setRegionValues] = useState({});
   const [activeAction, setActiveAction] = useState(null);
+  const [isStreaming, setIsStreaming] = useState(false);
   const ws = useRef(null);
   const streamRef = useRef(null);
+  const dragRef = useRef(null);
+  const sendTimerRef = useRef(null);
+  const storageKey = 'web_server_regions_v1';
 
-  const startStream = (e) => {
-    e.preventDefault();
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+  const isFiniteNumber = (value) => Number.isFinite(value);
+  const getFrameSize = () => {
+    if (!streamRef.current) return null;
+    const rect = streamRef.current.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    return { width: rect.width, height: rect.height };
+  };
+
+  const sanitizeRegions = (list) => {
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((region) => ({
+        id: typeof region.id === 'string' ? region.id : crypto.randomUUID(),
+        name: typeof region.name === 'string' && region.name.trim() ? region.name.trim() : '領域',
+        x: isFiniteNumber(region.x) ? region.x : 10,
+        y: isFiniteNumber(region.y) ? region.y : 10,
+        w: isFiniteNumber(region.w) ? region.w : 160,
+        h: isFiniteNumber(region.h) ? region.h : 120,
+        color: typeof region.color === 'string' ? region.color : '#ff3b3b',
+      }))
+      .filter((region) => region.w > 0 && region.h > 0);
+  };
+
+  const startStream = () => {
     // 既存接続をクリーンに閉じる
     if (ws.current) ws.current.close();
 
@@ -38,6 +65,7 @@ function App() {
         source: target,
         regions,
       }));
+      setIsStreaming(true);
     };
 
     ws.current.onmessage = (event) => {
@@ -82,6 +110,7 @@ function App() {
 
     ws.current.onclose = () => {
       console.log('WebSocket disconnected');
+      setIsStreaming(false);
     };
   };
 
@@ -90,10 +119,24 @@ function App() {
     return () => ws.current && ws.current.close();
   }, []);
 
+  useEffect(() => {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      const next = sanitizeRegions(parsed);
+      if (next.length > 0) {
+        setRegions(next);
+      }
+    } catch (error) {
+      console.warn('Failed to parse stored regions', error);
+    }
+  }, []);
+
   const stopStream = () => {
     if (ws.current) ws.current.close();
-    setImageData('');
     setRegionValues({});
+    setIsStreaming(false);
   };
 
   const addRegion = () => {
@@ -105,13 +148,24 @@ function App() {
       alert('同じ名前の領域は作成できません。');
       return;
     }
+    const palette = ['#ff3b3b', '#26d0ce', '#1a7fda', '#ffb703', '#c77dff', '#80ed99'];
+    const usedColors = new Set(regions.map((region) => region.color));
+    const available = palette.filter((color) => !usedColors.has(color));
+    const colorPool = available.length > 0 ? available : palette;
+    const color = colorPool[Math.floor(Math.random() * colorPool.length)];
+    const frameSize = getFrameSize();
+    const defaultW = frameSize ? Math.max(80, Math.round(frameSize.width * 0.25)) : 160;
+    const defaultH = frameSize ? Math.max(60, Math.round(frameSize.height * 0.18)) : 120;
+    const maxX = frameSize ? Math.max(frameSize.width - defaultW, 0) : 0;
+    const maxY = frameSize ? Math.max(frameSize.height - defaultH, 0) : 0;
     const newRegion = {
       id: crypto.randomUUID(),
       name: trimmedName,
-      x: 10,
-      y: 10,
-      w: 35,
-      h: 22,
+      x: Math.min(16, maxX),
+      y: Math.min(16, maxY),
+      w: defaultW,
+      h: defaultH,
+      color,
     };
     setRegions((prev) => [...prev, newRegion]);
   };
@@ -125,31 +179,65 @@ function App() {
     });
   };
 
+  const updateRegionName = (id, name) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    if (regions.some((region) => region.id !== id && region.name === trimmedName)) {
+      alert('同じ名前の領域は作成できません。');
+      return;
+    }
+    setRegions((prev) =>
+      prev.map((region) =>
+        region.id === id ? { ...region, name: trimmedName } : region
+      )
+    );
+  };
+
+  const updateRegionColor = (id, color) => {
+    setRegions((prev) =>
+      prev.map((region) =>
+        region.id === id ? { ...region, color } : region
+      )
+    );
+  };
+
   useEffect(() => {
     if (!activeAction) return;
 
     const handleMove = (event) => {
-      if (!streamRef.current) return;
+      if (!streamRef.current || !dragRef.current) return;
+      const drag = dragRef.current;
       const rect = streamRef.current.getBoundingClientRect();
-      const dx = ((event.clientX - rect.left) / rect.width) * 100 - activeAction.startX;
-      const dy = ((event.clientY - rect.top) / rect.height) * 100 - activeAction.startY;
+      if (rect.width === 0 || rect.height === 0) return;
+      const rawX = event.clientX - rect.left;
+      const rawY = event.clientY - rect.top;
+      if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+      const pointerX = clamp(rawX, 0, rect.width);
+      const pointerY = clamp(rawY, 0, rect.height);
+      const dx = pointerX - drag.lastX;
+      const dy = pointerY - drag.lastY;
+      if (!isFiniteNumber(dx) || !isFiniteNumber(dy)) return;
+      dragRef.current.lastX = pointerX;
+      dragRef.current.lastY = pointerY;
 
       setRegions((prev) =>
         prev.map((region) => {
-          if (region.id !== activeAction.id) return region;
-          if (activeAction.type === 'move') {
-            const x = Math.min(Math.max(activeAction.originX + dx, 0), 100 - region.w);
-            const y = Math.min(Math.max(activeAction.originY + dy, 0), 100 - region.h);
+          if (!dragRef.current) return region;
+          if (region.id !== drag.id) return region;
+          if (drag.type === 'move') {
+            const x = clamp(pointerX - dragRef.current.offsetX, 0, Math.max(rect.width - region.w, 0));
+            const y = clamp(pointerY - dragRef.current.offsetY, 0, Math.max(rect.height - region.h, 0));
             return { ...region, x, y };
           }
-          const w = Math.min(Math.max(activeAction.originW + dx, 6), 100 - region.x);
-          const h = Math.min(Math.max(activeAction.originH + dy, 6), 100 - region.y);
+          const w = clamp(region.w + dx, 20, Math.max(rect.width - region.x, 20));
+          const h = clamp(region.h + dy, 20, Math.max(rect.height - region.y, 20));
           return { ...region, w, h };
         })
       );
     };
 
     const handleUp = () => {
+      dragRef.current = null;
       setActiveAction(null);
     };
 
@@ -163,15 +251,50 @@ function App() {
   }, [activeAction]);
 
   useEffect(() => {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-    ws.current.send(JSON.stringify({
-      type: 'regions',
-      regions,
-    }));
+    if (!isStreaming || !ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    const frameSize = getFrameSize();
+    if (!frameSize) return;
+    const { width, height } = frameSize;
+    if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
+    sendTimerRef.current = setTimeout(() => {
+      if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+      const sanitized = regions
+        .map((region) => ({
+          ...region,
+          x: clamp((region.x / width) * 100, 0, 100),
+          y: clamp((region.y / height) * 100, 0, 100),
+          w: clamp((region.w / width) * 100, 1, 100),
+          h: clamp((region.h / height) * 100, 1, 100),
+        }))
+        .filter((region) =>
+          isFiniteNumber(region.x) &&
+          isFiniteNumber(region.y) &&
+          isFiniteNumber(region.w) &&
+          isFiniteNumber(region.h)
+        );
+      ws.current.send(JSON.stringify({
+        type: 'regions',
+        regions: sanitized,
+      }));
+    }, 80);
+    return () => {
+      if (sendTimerRef.current) {
+        clearTimeout(sendTimerRef.current);
+        sendTimerRef.current = null;
+      }
+    };
+  }, [regions, isStreaming]);
+
+  useEffect(() => {
+    if (!regions.length) {
+      window.localStorage.removeItem(storageKey);
+      return;
+    }
+    window.localStorage.setItem(storageKey, JSON.stringify(regions));
   }, [regions]);
 
   return (
-    <div className="container">
+    <div className={`container${isStreaming ? ' streaming' : ''}`}>
       <header className="hero">
         <p className="eyebrow">Realtime Vision</p>
         <h2>Live Stream Viewer</h2>
@@ -179,7 +302,7 @@ function App() {
           カメラまたはストリームURLに接続して、YOLOv8の検出結果をリアルタイムで確認できます。
         </p>
       </header>
-      <form className="panel" onSubmit={startStream}>
+      <form className="panel" onSubmit={(event) => event.preventDefault()}>
         <div className="controls">
           <label className="field">
             <span>入力ソース</span>
@@ -209,12 +332,18 @@ function App() {
                 value={deviceIndex}
                 onChange={(e) => setDeviceIndex(e.target.value)}
               >
-                <option value="0">デバイス0（内蔵）</option>
+                <option value="0">デバイス0（既定）</option>
                 <option value="1">デバイス1</option>
               </select>
             </label>
           )}
-          <button className="primary" type="submit">ストリーム開始</button>
+          <button
+            className={`primary ${isStreaming ? 'danger' : ''}`}
+            type="button"
+            onClick={() => (isStreaming ? stopStream() : startStream())}
+          >
+            {isStreaming ? '停止' : 'ストリーム開始'}
+          </button>
         </div>
       </form>
       {/* imageData がセットされたら表示 */}
@@ -226,9 +355,6 @@ function App() {
               <div className="stream-actions">
                 <button className="ghost" type="button" onClick={addRegion}>
                   領域作成 +
-                </button>
-                <button className="secondary" type="button" onClick={stopStream}>
-                  スタート画面へ戻る
                 </button>
               </div>
             </div>
@@ -244,36 +370,57 @@ function App() {
                     key={region.id}
                     className="region-box"
                     style={{
-                      left: `${region.x}%`,
-                      top: `${region.y}%`,
-                      width: `${region.w}%`,
-                      height: `${region.h}%`,
+                      left: `${region.x}px`,
+                      top: `${region.y}px`,
+                      width: `${region.w}px`,
+                      height: `${region.h}px`,
+                      '--region-color': region.color || '#ff3b3b',
                     }}
                     onMouseDown={(event) => {
                       event.preventDefault();
-                      setActiveAction({
+                      const rect = streamRef.current.getBoundingClientRect();
+                      if (rect.width === 0 || rect.height === 0) return;
+                      const rawX = event.clientX - rect.left;
+                      const rawY = event.clientY - rect.top;
+                      if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+                      const pointerX = clamp(rawX, 0, rect.width);
+                      const pointerY = clamp(rawY, 0, rect.height);
+                      const offsetX = clamp(pointerX - region.x, 0, region.w);
+                      const offsetY = clamp(pointerY - region.y, 0, region.h);
+                      dragRef.current = {
                         id: region.id,
                         type: 'move',
-                        startX: ((event.clientX - streamRef.current.getBoundingClientRect().left) / streamRef.current.getBoundingClientRect().width) * 100,
-                        startY: ((event.clientY - streamRef.current.getBoundingClientRect().top) / streamRef.current.getBoundingClientRect().height) * 100,
-                        originX: region.x,
-                        originY: region.y,
-                      });
+                        lastX: pointerX,
+                        lastY: pointerY,
+                        offsetX,
+                        offsetY,
+                      };
+                      setActiveAction({ id: region.id, type: 'move' });
                     }}
                   >
-                    <span className="region-label">{region.name}</span>
+                    <span
+                      className={`region-label${region.y < 12 ? ' label-bottom' : ''}${region.x < 12 ? ' label-right' : ''}`}
+                    >
+                      {region.name}
+                    </span>
                     <span
                       className="region-handle"
                       onMouseDown={(event) => {
                         event.stopPropagation();
-                        setActiveAction({
+                        const rect = streamRef.current.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) return;
+                        const rawX = event.clientX - rect.left;
+                        const rawY = event.clientY - rect.top;
+                        if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+                        const pointerX = clamp(rawX, 0, rect.width);
+                        const pointerY = clamp(rawY, 0, rect.height);
+                        dragRef.current = {
                           id: region.id,
                           type: 'resize',
-                          startX: ((event.clientX - streamRef.current.getBoundingClientRect().left) / streamRef.current.getBoundingClientRect().width) * 100,
-                          startY: ((event.clientY - streamRef.current.getBoundingClientRect().top) / streamRef.current.getBoundingClientRect().height) * 100,
-                          originW: region.w,
-                          originH: region.h,
-                        });
+                          lastX: pointerX,
+                          lastY: pointerY,
+                        };
+                        setActiveAction({ id: region.id, type: 'resize' });
                       }}
                     />
                   </div>
@@ -289,10 +436,28 @@ function App() {
               <ul>
                 {regions.map((region) => (
                   <li key={region.id}>
-                    <span className="result-name">{region.name}</span>
+                    <input
+                      className="result-name-input"
+                      type="text"
+                      value={region.name}
+                      onChange={(event) => updateRegionName(region.id, event.target.value)}
+                    />
                     <span className="result-count">
                       {regionValues[region.id] ?? ''}
                     </span>
+                    {/*
+                    <span className="result-meta">
+                      x:{Math.round(region.x)} y:{Math.round(region.y)}
+                      w:{Math.round(region.w)} h:{Math.round(region.h)}
+                    </span>
+                    */}
+                    <input
+                      className="result-color-input"
+                      type="color"
+                      value={region.color || '#ff3b3b'}
+                      onChange={(event) => updateRegionColor(region.id, event.target.value)}
+                      aria-label={`${region.name}の色を変更`}
+                    />
                     <button
                       className="icon-button"
                       type="button"

@@ -1,13 +1,13 @@
 :root {
-  --bg: #0b0f1a;
-  --bg-soft: #151c2f;
-  --panel: #0f1526;
-  --panel-border: rgba(255, 255, 255, 0.08);
-  --text: #eef2ff;
-  --muted: rgba(238, 242, 255, 0.65);
-  --accent: #26d0ce;
-  --accent-2: #1a7fda;
-  --shadow: 0 24px 60px rgba(3, 5, 20, 0.45);
+  --bg: #182033; /* 画面全体のベース背景 */
+  --bg-soft: #253049; /* 入力ソースなどフォーム背景 */
+  --panel: #1c2a47; /* パネル面の背景 */
+  --panel-border: rgba(255, 255, 255, 0.08); /* パネル枠の境界線 */
+  --text: #f8fbff; /* メイン文字色 */
+  --muted: rgba(248, 251, 255, 0.75); /* 補助文字色 */
+  --accent: #26d0ce; /* アクセント（シアン系） */
+  --accent-2: #1a7fda; /* アクセント（ブルー系） */
+  --shadow: 0 24px 60px rgba(3, 5, 20, 0.45); /* 影（浮き上がり） */
 }
 
 * {
@@ -19,9 +19,9 @@ body {
   min-height: 100vh;
   font-family: "Space Grotesk", "JetBrains Mono", "Segoe UI", sans-serif;
   background:
-    radial-gradient(circle at 15% 20%, rgba(38, 208, 206, 0.22), transparent 40%),
-    radial-gradient(circle at 80% 10%, rgba(26, 127, 218, 0.25), transparent 38%),
-    linear-gradient(140deg, #070a12 0%, #0b1120 45%, #0d1324 100%);
+    radial-gradient(circle at 15% 20%, rgba(38, 208, 206, 0.32), transparent 45%), /* 左上の光彩 */
+    radial-gradient(circle at 80% 10%, rgba(26, 127, 218, 0.32), transparent 42%), /* 右上の光彩 */
+    linear-gradient(140deg, #121a2d 0%, #1a253b 45%, #1f2c47 100%); /* 画面全体のグラデーション */
   color: var(--text);
 }
 
@@ -29,6 +29,27 @@ body {
   max-width: 980px;
   margin: 0 auto;
   padding: 48px 20px 64px;
+}
+
+.container.streaming {
+  height: 100vh;
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.container.streaming .hero {
+  margin-bottom: 16px;
+}
+
+.container.streaming .panel {
+  padding: 16px;
+}
+
+.container.streaming .preview {
+  flex: 1;
+  min-height: 0;
+  align-content: start;
 }
 
 .hero {
@@ -51,14 +72,14 @@ h2 {
 }
 
 .subhead {
-  max-width: 620px;
+  max-width: 100%;
   color: var(--muted);
   margin: 0;
   font-size: 16px;
 }
 
 .panel {
-  background: linear-gradient(135deg, rgba(20, 30, 60, 0.9), rgba(13, 20, 42, 0.95));
+  background: linear-gradient(135deg, rgba(46, 64, 108, 0.62), rgba(28, 40, 70, 0.74));
   border: 1px solid var(--panel-border);
   border-radius: 18px;
   padding: 24px;
@@ -101,8 +122,8 @@ button {
 
 input,
 select {
-  background: var(--bg-soft);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(32, 46, 80, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.22);
   padding: 12px 14px;
   border-radius: 12px;
   outline: none;
@@ -135,16 +156,25 @@ select {
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
+.primary.danger {
+  background: linear-gradient(135deg, #ff3b3b, #ff6b6b);
+  box-shadow: 0 14px 30px rgba(255, 59, 59, 0.35);
+}
+
 .primary:hover {
   transform: translateY(-1px);
   box-shadow: 0 18px 36px rgba(26, 127, 218, 0.45);
+}
+
+.primary.danger:hover {
+  box-shadow: 0 18px 36px rgba(255, 59, 59, 0.45);
 }
 
 .preview {
   margin-top: 28px;
   padding: 18px;
   border-radius: 18px;
-  background: rgba(10, 15, 30, 0.8);
+  background: rgba(20, 28, 46, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.06);
   box-shadow: var(--shadow);
   animation: fadeUp 1s ease both;
@@ -176,6 +206,7 @@ select {
 .stream-header h3 {
   margin: 0;
   font-size: 20px;
+  color: var(--text);
 }
 
 .stream-actions {
@@ -189,7 +220,7 @@ select {
   border-radius: 18px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(4, 8, 20, 0.8);
+  background: rgba(36, 50, 78, 0.5);
 }
 
 .region-layer {
@@ -199,32 +230,49 @@ select {
 
 .region-box {
   position: absolute;
-  border: 2px solid #ff3b3b;
+  border: 2px solid var(--region-color, #ff3b3b);
   border-radius: 6px;
   cursor: move;
   display: flex;
   align-items: flex-start;
-  justify-content: space-between;
+  justify-content: flex-end;
   padding: 6px;
-  color: #ffb3b3;
+  color: var(--region-color, #ffb3b3);
   font-size: 12px;
-  background: rgba(255, 59, 59, 0.08);
+  background: color-mix(in srgb, var(--region-color, #ff3b3b) 18%, transparent);
 }
 
 .region-label {
-  background: rgba(10, 15, 30, 0.8);
+  position: absolute;
+  left: -2px;
+  top: -28px;
+  background: rgba(10, 15, 30, 0.9);
   border-radius: 4px;
   padding: 2px 6px;
-  border: 1px solid rgba(255, 59, 59, 0.4);
+  border: 1px solid var(--region-color, #ff3b3b);
+  color: var(--region-color, #ffb3b3);
+  white-space: nowrap;
+}
+
+.region-label.label-bottom {
+  top: auto;
+  bottom: -28px;
+}
+
+.region-label.label-right {
+  left: auto;
+  right: -2px;
 }
 
 .region-handle {
+  cursor: nwse-resize;
+  position: absolute;
+  right: 0;
+  bottom: 0;
   width: 12px;
   height: 12px;
+  background: var(--region-color, #ff3b3b);
   border-radius: 2px;
-  background: #ff3b3b;
-  cursor: nwse-resize;
-  align-self: flex-end;
 }
 
 .results {
@@ -233,6 +281,7 @@ select {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  overflow: auto;
 }
 
 .results h4 {
@@ -251,17 +300,22 @@ select {
 
 .results li {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
   gap: 8px;
   align-items: center;
-  background: rgba(21, 28, 47, 0.8);
+  background: rgba(24, 34, 56, 0.7);
   padding: 10px 12px;
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.result-name {
+.result-name-input {
   font-size: 14px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: var(--text);
 }
 
 .result-count {
@@ -270,6 +324,21 @@ select {
   padding: 2px 8px;
   border-radius: 8px;
   font-variant-numeric: tabular-nums;
+}
+
+.result-meta {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.result-color-input {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
 }
 
 .muted {
