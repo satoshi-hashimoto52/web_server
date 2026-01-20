@@ -10,6 +10,7 @@
 {
   "type": "start",
   "source": "http://..." | "rtsp://..." | "device:0",
+  "model": "model_name.pt",
   "regions": [
     {
       "id": "uuid",

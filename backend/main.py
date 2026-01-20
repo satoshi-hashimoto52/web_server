@@ -7,9 +7,10 @@ import cv2
 import base64
 import asyncio
 import json
+import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from detector import detect_objects  # detector.py から取り込み
+from detector import detect_objects, MODEL_DIR, MODEL_FILENAME  # detector.py から取り込み
 
 app = FastAPI()
 
@@ -22,11 +23,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/models")
+def list_models():
+    models = []
+    if os.path.isdir(MODEL_DIR):
+        for name in os.listdir(MODEL_DIR):
+            if name.endswith(".pt"):
+                models.append(name)
+    models.sort()
+    return {"models": models}
+
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
     cap = None
     regions = []
+    model_name = MODEL_FILENAME
     try:
         # 最初のメッセージを「ストリーム URL」または「デバイス指定」として受信
         raw_message = await websocket.receive_text()
@@ -36,6 +49,8 @@ async def websocket_stream(websocket: WebSocket):
             if isinstance(payload, dict) and payload.get("type") == "start":
                 stream_url = payload.get("source", "")
                 regions = payload.get("regions", []) or []
+                if payload.get("model"):
+                    model_name = payload.get("model")
         except json.JSONDecodeError:
             pass
 
@@ -49,6 +64,12 @@ async def websocket_stream(websocket: WebSocket):
             cap = cv2.VideoCapture(device_index)
         else:
             cap = cv2.VideoCapture(stream_url)
+
+        model_path = os.path.join(MODEL_DIR, model_name)
+        if not os.path.exists(model_path):
+            await websocket.send_text("ERROR: Model not found.")
+            await websocket.close()
+            return
         if not cap.isOpened():
             await websocket.send_text("ERROR: Unable to open stream.")
             await websocket.close()
@@ -73,7 +94,7 @@ async def websocket_stream(websocket: WebSocket):
                 pass
 
             # 物体検出 + 描画
-            frame, detections = detect_objects(frame)
+            frame, detections = detect_objects(frame, model_name)
 
             # 領域ごとの検出結果（左から結合）
             height, width = frame.shape[:2]

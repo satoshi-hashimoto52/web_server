@@ -9,6 +9,8 @@ function App() {
   const [sourceType, setSourceType] = useState('url');
   const [streamUrl, setStreamUrl] = useState('');
   const [deviceIndex, setDeviceIndex] = useState('0');
+  const [modelOptions, setModelOptions] = useState([]);
+  const [selectedModel, setSelectedModel] = useState('');
   const [imageData, setImageData] = useState('');
   const [regions, setRegions] = useState([]);
   const [regionValues, setRegionValues] = useState({});
@@ -64,6 +66,7 @@ function App() {
         type: 'start',
         source: target,
         regions,
+        model: selectedModel || undefined,
       }));
       setIsStreaming(true);
     };
@@ -118,6 +121,25 @@ function App() {
     // アンマウント時にクリーンアップ
     return () => ws.current && ws.current.close();
   }, []);
+
+  useEffect(() => {
+    const loadModels = async () => {
+      try {
+        const response = await fetch('http://localhost:5050/models');
+        if (!response.ok) return;
+        const data = await response.json();
+        if (Array.isArray(data.models)) {
+          setModelOptions(data.models);
+          if (!selectedModel && data.models.length > 0) {
+            setSelectedModel(data.models[0]);
+          }
+        }
+      } catch (error) {
+        console.warn('Failed to load models', error);
+      }
+    };
+    loadModels();
+  }, [selectedModel]);
 
   useEffect(() => {
     const raw = window.localStorage.getItem(storageKey);
@@ -337,6 +359,21 @@ function App() {
               </select>
             </label>
           )}
+          <label className="field">
+            <span>モデル</span>
+            <select
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+            >
+              {modelOptions.length === 0 ? (
+                <option value="">読み込み中</option>
+              ) : (
+                modelOptions.map((name) => (
+                  <option key={name} value={name}>{name}</option>
+                ))
+              )}
+            </select>
+          </label>
           <button
             className={`primary ${isStreaming ? 'danger' : ''}`}
             type="button"

@@ -23,3 +23,6 @@
 ## 入力ソース
 - HTTP/RTSP URL
 - Macbookカメラ（`device:0` など）
+
+## モデル選択
+- `backend/models/` 内の `.pt` をUIから選択して推論に使用する。
