@@ -3,6 +3,8 @@
 Webカメラ/RTSP/HTTPストリームをYOLOv8で推論し、ブラウザにリアルタイム表示する物体検出アプリです。
 推論領域を画面上で作成・移動・リサイズでき、領域内の検出結果を左から順に結合して表示します。
 
+<img src="docs/images/推論時_20260120.png" width="600">
+
 ## 構成
 - backend: FastAPI + OpenCV + YOLOv8
 - frontend: React + Vite + WebSocket
