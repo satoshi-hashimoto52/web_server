@@ -23,6 +23,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def resolve_model_name(name):
+    if not isinstance(name, str):
+        return None
+    candidate = os.path.basename(name.strip())
+    if not candidate:
+        return None
+    model_path = os.path.join(MODEL_DIR, candidate)
+    if not os.path.exists(model_path):
+        return None
+    return candidate
+
 
 @app.get("/models")
 def list_models():
@@ -50,7 +61,9 @@ async def websocket_stream(websocket: WebSocket):
                 stream_url = payload.get("source", "")
                 regions = payload.get("regions", []) or []
                 if payload.get("model"):
-                    model_name = payload.get("model")
+                    resolved = resolve_model_name(payload.get("model"))
+                    if resolved:
+                        model_name = resolved
         except json.JSONDecodeError:
             pass
 
@@ -86,8 +99,14 @@ async def websocket_stream(websocket: WebSocket):
                 update_message = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
                 try:
                     update_payload = json.loads(update_message)
-                    if isinstance(update_payload, dict) and update_payload.get("type") == "regions":
-                        regions = update_payload.get("regions", []) or []
+                    if isinstance(update_payload, dict):
+                        update_type = update_payload.get("type")
+                        if update_type == "regions":
+                            regions = update_payload.get("regions", []) or []
+                        elif update_type == "model":
+                            resolved = resolve_model_name(update_payload.get("model"))
+                            if resolved:
+                                model_name = resolved
                 except json.JSONDecodeError:
                     pass
             except asyncio.TimeoutError:

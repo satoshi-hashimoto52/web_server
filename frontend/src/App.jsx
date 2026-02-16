@@ -323,6 +323,15 @@ function App() {
   }, [regions, isStreaming]);
 
   useEffect(() => {
+    if (!isStreaming || !selectedModel) return;
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    ws.current.send(JSON.stringify({
+      type: 'model',
+      model: selectedModel,
+    }));
+  }, [selectedModel, isStreaming]);
+
+  useEffect(() => {
     if (!regions.length) {
       window.localStorage.removeItem(storageKey);
       return;
