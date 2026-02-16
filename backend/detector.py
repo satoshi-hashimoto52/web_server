@@ -7,11 +7,36 @@ import cv2
 from ultralytics import YOLO
 import os
 import torch
+from glob import glob
 
 # モデルを一度だけロード
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "models")
-MODEL_FILENAME = "7sgm_20250221.pt"
+MODEL_FILENAME = "7sgm_yolov8_20250221.pt"
+
+
+def _resolve_default_model_filename():
+    """
+    既定モデルが見つからない場合は models 配下の .pt から自動選択する。
+    7sgm* を優先し、なければ最終更新時刻が新しい .pt を使う。
+    """
+    default_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
+    if os.path.exists(default_path):
+        return MODEL_FILENAME
+
+    preferred = sorted(glob(os.path.join(MODEL_DIR, "7sgm*.pt")))
+    if preferred:
+        return os.path.basename(preferred[-1])
+
+    candidates = glob(os.path.join(MODEL_DIR, "*.pt"))
+    if candidates:
+        latest = max(candidates, key=os.path.getmtime)
+        return os.path.basename(latest)
+
+    return MODEL_FILENAME
+
+
+MODEL_FILENAME = _resolve_default_model_filename()
 model_path = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
 if not os.path.exists(model_path):
