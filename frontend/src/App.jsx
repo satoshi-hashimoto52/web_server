@@ -4,8 +4,10 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import './styles.css';
+import DashboardPage from './DashboardPage';
 
 function App() {
+  const [activeTab, setActiveTab] = useState('stream');
   const [sourceType, setSourceType] = useState('url');
   const [streamUrl, setStreamUrl] = useState('');
   const [deviceIndex, setDeviceIndex] = useState('0');
@@ -341,242 +343,265 @@ function App() {
 
   return (
     <div className={`container${isStreaming ? ' streaming' : ''}`}>
-      <header className="hero">
-        <p className="eyebrow">Realtime Vision</p>
-        <h2>Live Stream Viewer</h2>
-        <p className="subhead">
-          カメラまたはストリームURLに接続して、YOLOv8の検出結果をリアルタイムで確認できます。
-        </p>
-      </header>
-      <form className="panel" onSubmit={(event) => event.preventDefault()}>
-        <div className="controls">
-          <label className="field">
-            <span>入力ソース</span>
-            <select
-              value={sourceType}
-              onChange={(e) => setSourceType(e.target.value)}
-            >
-              <option value="url">HTTP/RTSP URL</option>
-              <option value="device">Macbook カメラ</option>
-            </select>
-          </label>
-          {sourceType === 'url' ? (
-            <label className="field field-wide">
-              <span>ストリームURL</span>
-              <input
-                type="text"
-                value={streamUrl}
-                placeholder="http:// または rtsp://"
-                onChange={(e) => setStreamUrl(e.target.value)}
-                required
-              />
-            </label>
-          ) : (
-            <label className="field field-wide">
-              <span>デバイス</span>
-              <select
-                value={deviceIndex}
-                onChange={(e) => setDeviceIndex(e.target.value)}
-              >
-                <option value="0">デバイス0（既定）</option>
-                <option value="1">デバイス1</option>
-              </select>
-            </label>
-          )}
-          <label className="field">
-            <span>モデル</span>
-            <select
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-            >
-              {modelOptions.length === 0 ? (
-                <option value="">読み込み中</option>
+      <div className="tab-row">
+        <button
+          type="button"
+          className={`tab-button ${activeTab === 'stream' ? 'active' : ''}`}
+          onClick={() => setActiveTab('stream')}
+        >
+          Stream
+        </button>
+        <button
+          type="button"
+          className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`}
+          onClick={() => setActiveTab('dashboard')}
+        >
+          Dashboard
+        </button>
+      </div>
+
+      {activeTab === 'dashboard' ? (
+        <DashboardPage />
+      ) : (
+        <>
+          <header className="hero">
+            <p className="eyebrow">Realtime Vision</p>
+            <h2>Live Stream Viewer</h2>
+            <p className="subhead">
+              カメラまたはストリームURLに接続して、YOLOv8の検出結果をリアルタイムで確認できます。
+            </p>
+          </header>
+          <form className="panel" onSubmit={(event) => event.preventDefault()}>
+            <div className="controls">
+              <label className="field">
+                <span>入力ソース</span>
+                <select
+                  value={sourceType}
+                  onChange={(e) => setSourceType(e.target.value)}
+                >
+                  <option value="url">HTTP/RTSP URL</option>
+                  <option value="device">Macbook カメラ</option>
+                </select>
+              </label>
+              {sourceType === 'url' ? (
+                <label className="field field-wide">
+                  <span>ストリームURL</span>
+                  <input
+                    type="text"
+                    value={streamUrl}
+                    placeholder="http:// または rtsp://"
+                    onChange={(e) => setStreamUrl(e.target.value)}
+                    required
+                  />
+                </label>
               ) : (
-                modelOptions.map((name) => (
-                  <option key={name} value={name}>{name}</option>
-                ))
+                <label className="field field-wide">
+                  <span>デバイス</span>
+                  <select
+                    value={deviceIndex}
+                    onChange={(e) => setDeviceIndex(e.target.value)}
+                  >
+                    <option value="0">デバイス0（既定）</option>
+                    <option value="1">デバイス1</option>
+                  </select>
+                </label>
               )}
-            </select>
-          </label>
-          <button
-            className={`primary ${isStreaming ? 'danger' : ''}`}
-            type="button"
-            onClick={() => (isStreaming ? stopStream() : startStream())}
-          >
-            {isStreaming ? '停止' : 'ストリーム開始'}
-          </button>
-        </div>
-      </form>
-      {/* imageData がセットされたら表示 */}
-      {imageData && (
-        <div className="preview">
-          <div className="stream-column">
-            <div className="stream-header">
-              <h3>エリア_カメラ</h3>
-              <div className="stream-actions">
-                <button className="ghost" type="button" onClick={addRegion}>
-                  領域作成 +
-                </button>
-              </div>
+              <label className="field">
+                <span>モデル</span>
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                >
+                  {modelOptions.length === 0 ? (
+                    <option value="">読み込み中</option>
+                  ) : (
+                    modelOptions.map((name) => (
+                      <option key={name} value={name}>{name}</option>
+                    ))
+                  )}
+                </select>
+              </label>
+              <button
+                className={`primary ${isStreaming ? 'danger' : ''}`}
+                type="button"
+                onClick={() => (isStreaming ? stopStream() : startStream())}
+              >
+                {isStreaming ? '停止' : 'ストリーム開始'}
+              </button>
             </div>
-            <div className="stream-frame" ref={streamRef}>
-              <img
-                src={imageData}
-                alt="Live Stream"
-                className="stream"
-              />
-              <div className="region-layer">
-                {regions.map((region) => (
-                  <div
-                    key={region.id}
-                    className="region-box"
-                    style={{
-                      left: `${region.x}px`,
-                      top: `${region.y}px`,
-                      width: `${region.w}px`,
-                      height: `${region.h}px`,
-                      '--region-color': region.color || '#ff3b3b',
-                    }}
-                    onMouseDown={(event) => {
-                      event.preventDefault();
-                      const rect = streamRef.current.getBoundingClientRect();
-                      if (rect.width === 0 || rect.height === 0) return;
-                      const rawX = event.clientX - rect.left;
-                      const rawY = event.clientY - rect.top;
-                      if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
-                      const pointerX = clamp(rawX, 0, rect.width);
-                      const pointerY = clamp(rawY, 0, rect.height);
-                      const offsetX = clamp(pointerX - region.x, 0, region.w);
-                      const offsetY = clamp(pointerY - region.y, 0, region.h);
-                      dragRef.current = {
-                        id: region.id,
-                        type: 'move',
-                        lastX: pointerX,
-                        lastY: pointerY,
-                        offsetX,
-                        offsetY,
-                      };
-                      setActiveAction({ id: region.id, type: 'move' });
-                    }}
-                  >
-                    <span
-                      className={`region-label${region.y < 12 ? ' label-bottom' : ''}${region.x < 12 ? ' label-right' : ''}`}
-                    >
-                      {region.name}
-                    </span>
-                    <span
-                      className="region-handle"
-                      onMouseDown={(event) => {
-                        event.stopPropagation();
-                        const rect = streamRef.current.getBoundingClientRect();
-                        if (rect.width === 0 || rect.height === 0) return;
-                        const rawX = event.clientX - rect.left;
-                        const rawY = event.clientY - rect.top;
-                        if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
-                        const pointerX = clamp(rawX, 0, rect.width);
-                        const pointerY = clamp(rawY, 0, rect.height);
-                        dragRef.current = {
-                          id: region.id,
-                          type: 'resize',
-                          lastX: pointerX,
-                          lastY: pointerY,
-                        };
-                        setActiveAction({ id: region.id, type: 'resize' });
-                      }}
-                    />
+          </form>
+          {/* imageData がセットされたら表示 */}
+          {imageData && (
+            <div className="preview">
+              <div className="stream-column">
+                <div className="stream-header">
+                  <h3>エリア_カメラ</h3>
+                  <div className="stream-actions">
+                    <button className="ghost" type="button" onClick={addRegion}>
+                      領域作成 +
+                    </button>
                   </div>
-                ))}
-              </div>
-            </div>
-          </div>
-          <aside className="results">
-            <h4>検出結果</h4>
-            {regions.length === 0 ? (
-              <p className="muted">領域を作成すると結果が表示されます。</p>
-            ) : (
-              <ul>
-                {regions.map((region) => (
-                  <li
-                    key={region.id}
-                    className={`result-item${dragOverId === `${region.id}:before` ? ' is-drop-before' : ''}${dragOverId === `${region.id}:after` ? ' is-drop-after' : ''}`}
-                    draggable
-                    onDragStart={(event) => {
-                      event.dataTransfer.effectAllowed = 'move';
-                      event.dataTransfer.setData('text/plain', region.id);
-                    }}
-                    onDragOver={(event) => {
-                      event.preventDefault();
-                      event.dataTransfer.dropEffect = 'move';
-                      const rect = event.currentTarget.getBoundingClientRect();
-                      const isAfter = event.clientY > rect.top + rect.height / 2;
-                      const nextId = `${region.id}:${isAfter ? 'after' : 'before'}`;
-                      if (dragOverId !== nextId) {
-                        setDragOverId(nextId);
-                      }
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      const fromId = event.dataTransfer.getData('text/plain');
-                      const dropTarget = dragOverId || `${region.id}:after`;
-                      const [targetId, position] = dropTarget.split(':');
-                      if (!targetId) {
-                        reorderRegions(fromId, region.id);
-                        return;
-                      }
-                      setRegions((prev) => {
-                        const fromIndex = prev.findIndex((item) => item.id === fromId);
-                        const targetIndex = prev.findIndex((item) => item.id === targetId);
-                        if (fromIndex === -1 || targetIndex === -1) return prev;
-                        const next = [...prev];
-                        const [moved] = next.splice(fromIndex, 1);
-                        const insertIndex = position === 'before' ? targetIndex : targetIndex + 1;
-                        next.splice(insertIndex, 0, moved);
-                        return next;
-                      });
-                      setDragOverId(null);
-                    }}
-                    onDragLeave={() => setDragOverId(null)}
-                  >
-                    <div className="result-row">
-                      <input
-                        className="result-name-input"
-                        type="text"
-                        value={region.name}
-                        onChange={(event) => updateRegionName(region.id, event.target.value)}
-                      />
-                      <input
-                        className="result-color-input"
-                        type="color"
-                        value={region.color || '#ff3b3b'}
-                        onChange={(event) => updateRegionColor(region.id, event.target.value)}
-                        aria-label={`${region.name}の色を変更`}
-                      />
-                      <button
-                        className="icon-button"
-                        type="button"
-                        onClick={() => removeRegion(region.id)}
-                        aria-label={`${region.name}を削除`}
+                </div>
+                <div className="stream-frame" ref={streamRef}>
+                  <img
+                    src={imageData}
+                    alt="Live Stream"
+                    className="stream"
+                  />
+                  <div className="region-layer">
+                    {regions.map((region) => (
+                      <div
+                        key={region.id}
+                        className="region-box"
+                        style={{
+                          left: `${region.x}px`,
+                          top: `${region.y}px`,
+                          width: `${region.w}px`,
+                          height: `${region.h}px`,
+                          '--region-color': region.color || '#ff3b3b',
+                        }}
+                        onMouseDown={(event) => {
+                          event.preventDefault();
+                          const rect = streamRef.current.getBoundingClientRect();
+                          if (rect.width === 0 || rect.height === 0) return;
+                          const rawX = event.clientX - rect.left;
+                          const rawY = event.clientY - rect.top;
+                          if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+                          const pointerX = clamp(rawX, 0, rect.width);
+                          const pointerY = clamp(rawY, 0, rect.height);
+                          const offsetX = clamp(pointerX - region.x, 0, region.w);
+                          const offsetY = clamp(pointerY - region.y, 0, region.h);
+                          dragRef.current = {
+                            id: region.id,
+                            type: 'move',
+                            lastX: pointerX,
+                            lastY: pointerY,
+                            offsetX,
+                            offsetY,
+                          };
+                          setActiveAction({ id: region.id, type: 'move' });
+                        }}
                       >
-                        −
-                      </button>
-                    </div>
-                    <div className="result-value">
-                      <span className="result-count">
-                        {regionValues[region.id] ?? ''}
-                      </span>
-                      {/*
-                      <span className="result-meta">
-                        x:{Math.round(region.x)} y:{Math.round(region.y)}
-                        w:{Math.round(region.w)} h:{Math.round(region.h)}
-                      </span>
-                      */}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </aside>
-        </div>
+                        <span
+                          className={`region-label${region.y < 12 ? ' label-bottom' : ''}${region.x < 12 ? ' label-right' : ''}`}
+                        >
+                          {region.name}
+                        </span>
+                        <span
+                          className="region-handle"
+                          onMouseDown={(event) => {
+                            event.stopPropagation();
+                            const rect = streamRef.current.getBoundingClientRect();
+                            if (rect.width === 0 || rect.height === 0) return;
+                            const rawX = event.clientX - rect.left;
+                            const rawY = event.clientY - rect.top;
+                            if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+                            const pointerX = clamp(rawX, 0, rect.width);
+                            const pointerY = clamp(rawY, 0, rect.height);
+                            dragRef.current = {
+                              id: region.id,
+                              type: 'resize',
+                              lastX: pointerX,
+                              lastY: pointerY,
+                            };
+                            setActiveAction({ id: region.id, type: 'resize' });
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <aside className="results">
+                <h4>検出結果</h4>
+                {regions.length === 0 ? (
+                  <p className="muted">領域を作成すると結果が表示されます。</p>
+                ) : (
+                  <ul>
+                    {regions.map((region) => (
+                      <li
+                        key={region.id}
+                        className={`result-item${dragOverId === `${region.id}:before` ? ' is-drop-before' : ''}${dragOverId === `${region.id}:after` ? ' is-drop-after' : ''}`}
+                        draggable
+                        onDragStart={(event) => {
+                          event.dataTransfer.effectAllowed = 'move';
+                          event.dataTransfer.setData('text/plain', region.id);
+                        }}
+                        onDragOver={(event) => {
+                          event.preventDefault();
+                          event.dataTransfer.dropEffect = 'move';
+                          const rect = event.currentTarget.getBoundingClientRect();
+                          const isAfter = event.clientY > rect.top + rect.height / 2;
+                          const nextId = `${region.id}:${isAfter ? 'after' : 'before'}`;
+                          if (dragOverId !== nextId) {
+                            setDragOverId(nextId);
+                          }
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          const fromId = event.dataTransfer.getData('text/plain');
+                          const dropTarget = dragOverId || `${region.id}:after`;
+                          const [targetId, position] = dropTarget.split(':');
+                          if (!targetId) {
+                            reorderRegions(fromId, region.id);
+                            return;
+                          }
+                          setRegions((prev) => {
+                            const fromIndex = prev.findIndex((item) => item.id === fromId);
+                            const targetIndex = prev.findIndex((item) => item.id === targetId);
+                            if (fromIndex === -1 || targetIndex === -1) return prev;
+                            const next = [...prev];
+                            const [moved] = next.splice(fromIndex, 1);
+                            const insertIndex = position === 'before' ? targetIndex : targetIndex + 1;
+                            next.splice(insertIndex, 0, moved);
+                            return next;
+                          });
+                          setDragOverId(null);
+                        }}
+                        onDragLeave={() => setDragOverId(null)}
+                      >
+                        <div className="result-row">
+                          <input
+                            className="result-name-input"
+                            type="text"
+                            value={region.name}
+                            onChange={(event) => updateRegionName(region.id, event.target.value)}
+                          />
+                          <input
+                            className="result-color-input"
+                            type="color"
+                            value={region.color || '#ff3b3b'}
+                            onChange={(event) => updateRegionColor(region.id, event.target.value)}
+                            aria-label={`${region.name}の色を変更`}
+                          />
+                          <button
+                            className="icon-button"
+                            type="button"
+                            onClick={() => removeRegion(region.id)}
+                            aria-label={`${region.name}を削除`}
+                          >
+                            −
+                          </button>
+                        </div>
+                        <div className="result-value">
+                          <span className="result-count">
+                            {regionValues[region.id] ?? ''}
+                          </span>
+                          {/*
+                          <span className="result-meta">
+                            x:{Math.round(region.x)} y:{Math.round(region.y)}
+                            w:{Math.round(region.w)} h:{Math.round(region.h)}
+                          </span>
+                          */}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </aside>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

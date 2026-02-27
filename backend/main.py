@@ -7,12 +7,33 @@ import cv2
 import base64
 import asyncio
 import json
+import logging
 import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from uuid import uuid4
+
+import requests
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from db import (
+    get_latest_readings,
+    get_last_alert_ts,
+    get_meter_by_id,
+    get_meters,
+    get_readings,
+    init_db,
+    insert_reading,
+    set_last_alert_ts,
+    upsert_meter,
+)
 from detector import detect_objects, MODEL_DIR, MODEL_FILENAME  # detector.py から取り込み
+from inference_adapter import infer
 
 app = FastAPI()
+logger = logging.getLogger("meter_api")
 
 # CORS 設定（React 開発サーバーからの接続を許可）
 app.add_middleware(
@@ -22,6 +43,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_SAVE_ROOT = os.path.join(BASE_DIR, "data", "images")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+ALERT_SUPPRESS_MINUTES = 5
+
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
 
 def resolve_model_name(name):
     if not isinstance(name, str):
@@ -35,6 +67,228 @@ def resolve_model_name(name):
     return candidate
 
 
+class MeterUpsertRequest(BaseModel):
+    threshold_high: Optional[float] = None
+    threshold_low: Optional[float] = None
+    enabled: Optional[bool] = None
+
+
+def _parse_iso_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _should_send_alert_by_time(meter_id: str) -> bool:
+    last_ts = get_last_alert_ts(meter_id)
+    if not last_ts:
+        return True
+    last_dt = _parse_iso_datetime(last_ts)
+    if not last_dt:
+        return True
+    return datetime.now(timezone.utc) - last_dt >= timedelta(minutes=ALERT_SUPPRESS_MINUTES)
+
+
+def _post_to_slack(text: str) -> bool:
+    if not SLACK_WEBHOOK_URL:
+        logger.info("SLACK_WEBHOOK_URL is not set; skip slack alert")
+        return False
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=5)
+        if 200 <= resp.status_code < 300:
+            return True
+        logger.error("slack webhook failed status=%s body=%s", resp.status_code, resp.text)
+        return False
+    except Exception:
+        logger.exception("slack webhook request failed")
+        return False
+
+
+def _maybe_send_threshold_alert(reading: dict) -> bool:
+    meter_id = str(reading.get("meter_id", ""))
+    meter = get_meter_by_id(meter_id)
+    if not meter:
+        logger.info("meter setting not found; skip alert meter_id=%s", meter_id)
+        return False
+
+    enabled = int(meter.get("enabled") or 0)
+    if enabled != 1:
+        logger.info("meter alert disabled; skip alert meter_id=%s", meter_id)
+        return False
+
+    value = reading.get("value")
+    if value is None:
+        logger.info("reading value is null; skip alert meter_id=%s", meter_id)
+        return False
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        logger.info("reading value is not numeric; skip alert meter_id=%s", meter_id)
+        return False
+
+    threshold_high = meter.get("threshold_high")
+    threshold_low = meter.get("threshold_low")
+    over_high = threshold_high is not None and value_float > float(threshold_high)
+    under_low = threshold_low is not None and value_float < float(threshold_low)
+    if not over_high and not under_low:
+        return False
+
+    if not _should_send_alert_by_time(meter_id):
+        logger.info("suppress alert meter_id=%s within %s minutes", meter_id, ALERT_SUPPRESS_MINUTES)
+        return False
+
+    reason = "HIGH" if over_high else "LOW"
+    message = (
+        f"[Meter Alert] meter_id={meter_id} reason={reason} "
+        f"value={value_float} high={threshold_high} low={threshold_low} "
+        f"ts={reading.get('ts')}"
+    )
+    sent = _post_to_slack(message)
+    if sent:
+        set_last_alert_ts(meter_id, datetime.now(timezone.utc).isoformat())
+        logger.info("slack alert sent meter_id=%s", meter_id)
+    return sent
+
+
+@app.post("/api/v1/images")
+async def upload_image(
+    image: Optional[UploadFile] = File(None),
+    meter_id: str = Form("default"),
+    model_type: str = Form("dummy"),
+    model_name: str = Form(""),
+):
+    if image is None:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    content = await image.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="empty image")
+
+    if image.content_type and not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="invalid content type")
+
+    ext = os.path.splitext(image.filename or "")[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+        ext = ".jpg"
+
+    date_dir = os.path.join(IMAGE_SAVE_ROOT, datetime.utcnow().strftime("%Y%m%d"))
+    os.makedirs(date_dir, exist_ok=True)
+    filename = f"{uuid4().hex}{ext}"
+    abs_path = os.path.join(date_dir, filename)
+
+    try:
+        with open(abs_path, "wb") as f:
+            f.write(content)
+        logger.info("image received and saved: %s", abs_path)
+    except Exception:
+        logger.exception("failed to save uploaded image")
+        raise HTTPException(status_code=500, detail="failed to save image")
+
+    normalized_model_type = (model_type or "dummy").strip().lower()
+    if normalized_model_type not in {"dummy", "yolo"}:
+        raise HTTPException(status_code=400, detail="model_type must be dummy or yolo")
+
+    try:
+        result = infer(
+            image_path=abs_path,
+            meter_id=(meter_id or "default").strip() or "default",
+            model_type=normalized_model_type,
+            model_name=model_name.strip() or None,
+        )
+        logger.info("inference completed: meter_id=%s model_type=%s", result["meter_id"], result["model_type"])
+    except Exception:
+        logger.exception("inference failed")
+        raise HTTPException(status_code=500, detail="inference failed")
+
+    image_path_for_db = os.path.relpath(abs_path, BASE_DIR)
+
+    try:
+        reading = insert_reading(
+            meter_id=str(result.get("meter_id", "default")),
+            value=result.get("value", 0.0),
+            confidence=float(result.get("confidence", 0.0)),
+            image_path=image_path_for_db,
+            model_type=str(result.get("model_type", normalized_model_type)),
+        )
+        logger.info("reading saved to db: id=%s meter_id=%s", reading["id"], reading["meter_id"])
+    except Exception:
+        logger.exception("failed to save reading to db")
+        raise HTTPException(status_code=500, detail="db save failed")
+
+    alert_sent = False
+    try:
+        alert_sent = _maybe_send_threshold_alert(reading)
+    except Exception:
+        logger.exception("alert evaluation failed")
+
+    return {
+        "ok": True,
+        "reading": reading,
+        "alert_sent": alert_sent,
+    }
+
+
+@app.get("/api/v1/readings/latest")
+def api_get_latest_readings():
+    try:
+        rows = get_latest_readings()
+    except Exception:
+        logger.exception("failed to fetch latest readings")
+        raise HTTPException(status_code=500, detail="failed to fetch latest readings")
+    return rows
+
+
+@app.get("/api/v1/readings")
+def api_get_readings(
+    meter_id: str = Query(...),
+    from_ts: Optional[str] = Query(None, alias="from"),
+    to_ts: Optional[str] = Query(None, alias="to"),
+):
+    meter_id = (meter_id or "").strip()
+    if not meter_id:
+        raise HTTPException(status_code=400, detail="meter_id is required")
+    try:
+        rows = get_readings(meter_id=meter_id, from_ts=from_ts, to_ts=to_ts)
+    except Exception:
+        logger.exception("failed to fetch readings")
+        raise HTTPException(status_code=500, detail="failed to fetch readings")
+    return rows
+
+
+@app.get("/api/v1/meters")
+def api_get_meters():
+    try:
+        rows = get_meters()
+    except Exception:
+        logger.exception("failed to fetch meters")
+        raise HTTPException(status_code=500, detail="failed to fetch meters")
+    return rows
+
+
+@app.put("/api/v1/meters/{meter_id}")
+def api_upsert_meter(meter_id: str, payload: MeterUpsertRequest):
+    target_meter_id = (meter_id or "").strip()
+    if not target_meter_id:
+        raise HTTPException(status_code=400, detail="meter_id is required")
+    try:
+        row = upsert_meter(
+            meter_id=target_meter_id,
+            threshold_high=payload.threshold_high,
+            threshold_low=payload.threshold_low,
+            enabled=payload.enabled,
+        )
+    except Exception:
+        logger.exception("failed to upsert meter")
+        raise HTTPException(status_code=500, detail="failed to upsert meter")
+    return row
+
+
 @app.get("/models")
 def list_models():
     models = []
@@ -44,6 +298,7 @@ def list_models():
                 models.append(name)
     models.sort()
     return {"models": models}
+
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
