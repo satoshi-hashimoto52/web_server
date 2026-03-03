@@ -9,18 +9,14 @@ const jstFormat = (ts) => {
   return dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
 };
 
-const jstShortFormat = (ts) => {
+const toJstDateKey = (ts) => {
   if (!ts) return '';
   const dt = new Date(ts);
-  if (Number.isNaN(dt.getTime())) return String(ts);
-  return dt.toLocaleString('ja-JP', {
-    timeZone: 'Asia/Tokyo',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
+  if (Number.isNaN(dt.getTime())) return '';
+  const y = dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric' });
+  const m = dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: '2-digit' });
+  const d = dt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', day: '2-digit' });
+  return `${y}-${m}-${d}`;
 };
 
 function LatestReadingsTable({ readings }) {
@@ -90,12 +86,41 @@ function ReadingsChart({ points }) {
   const polyline = points
     .map((p, idx) => `${toX(idx)},${toY(Number(p.value ?? 0))}`)
     .join(' ');
+  const yTickCount = 5;
+  const yTicks = Array.from({ length: yTickCount }, (_, idx) => {
+    const ratio = idx / (yTickCount - 1);
+    const value = maxValue - range * ratio;
+    return {
+      y: padding + (height - padding * 2) * ratio,
+      label: Number.isInteger(value) ? String(value) : value.toFixed(1),
+    };
+  });
 
   return (
     <div className="dashboard-card">
       <h3>時系列グラフ</h3>
       <div className="chart-wrap">
         <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="meter history chart">
+          {yTicks.map((tick) => (
+            <g key={`y-tick-${tick.y}`}>
+              <line
+                x1={padding}
+                y1={tick.y}
+                x2={width - padding}
+                y2={tick.y}
+                stroke="rgba(255,255,255,0.12)"
+              />
+              <text
+                x={padding - 6}
+                y={tick.y + 3}
+                textAnchor="end"
+                fontSize="10"
+                fill="rgba(248,251,255,0.75)"
+              >
+                {tick.label}
+              </text>
+            </g>
+          ))}
           <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="rgba(255,255,255,0.35)" />
           <line x1={padding} y1={padding} x2={padding} y2={height - padding} stroke="rgba(255,255,255,0.35)" />
           <polyline fill="none" stroke="#3bd7a6" strokeWidth="2.5" points={polyline} />
@@ -105,15 +130,6 @@ function ReadingsChart({ points }) {
             return (
               <g key={`${p.ts}-${idx}`}>
                 <circle cx={x} cy={y} r="3.5" fill="#3aa0ff" />
-                <text
-                  x={x}
-                  y={Math.min(height - 4, y + 14)}
-                  textAnchor="middle"
-                  fontSize="9"
-                  fill="rgba(248,251,255,0.85)"
-                >
-                  {jstShortFormat(p.ts)}
-                </text>
               </g>
             );
           })}
@@ -210,6 +226,7 @@ function DashboardPage() {
   const [meters, setMeters] = useState([]);
   const [selectedMeterId, setSelectedMeterId] = useState('');
   const [readingHistory, setReadingHistory] = useState([]);
+  const [selectedDate, setSelectedDate] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -218,6 +235,18 @@ function DashboardPage() {
     () => meters.find((m) => m.meter_id === selectedMeterId) || null,
     [meters, selectedMeterId],
   );
+  const dateOptions = useMemo(() => {
+    const unique = new Set(
+      readingHistory
+        .map((row) => toJstDateKey(row.ts))
+        .filter((key) => key),
+    );
+    return Array.from(unique).sort((a, b) => (a < b ? 1 : -1));
+  }, [readingHistory]);
+  const filteredHistory = useMemo(() => {
+    if (!selectedDate) return readingHistory;
+    return readingHistory.filter((row) => toJstDateKey(row.ts) === selectedDate);
+  }, [readingHistory, selectedDate]);
 
   const loadDashboard = async () => {
     setLoading(true);
@@ -252,8 +281,15 @@ function DashboardPage() {
     const loadHistory = async () => {
       setError('');
       try {
-        const rows = await fetchReadings(selectedMeterId);
-        setReadingHistory(Array.isArray(rows) ? rows : []);
+        const toTs = new Date().toISOString();
+        const fromTs = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const rows = await fetchReadings(selectedMeterId, fromTs, toTs);
+        const nextRows = Array.isArray(rows) ? rows : [];
+        setReadingHistory(nextRows);
+        const nextDateOptions = Array.from(
+          new Set(nextRows.map((row) => toJstDateKey(row.ts)).filter((key) => key)),
+        ).sort((a, b) => (a < b ? 1 : -1));
+        setSelectedDate((prev) => (prev && nextDateOptions.includes(prev) ? prev : (nextDateOptions[0] || '')));
       } catch (e) {
         setError('履歴取得に失敗しました。');
         console.error(e);
@@ -308,7 +344,26 @@ function DashboardPage() {
         </select>
       </div>
 
-      <ReadingsChart points={readingHistory} />
+      <div className="dashboard-card">
+        <h3>日付選択</h3>
+        <select
+          value={selectedDate}
+          onChange={(e) => setSelectedDate(e.target.value)}
+          disabled={dateOptions.length === 0}
+        >
+          {dateOptions.length === 0 ? (
+            <option value="">データなし</option>
+          ) : (
+            dateOptions.map((date) => (
+              <option value={date} key={date}>
+                {date}
+              </option>
+            ))
+          )}
+        </select>
+      </div>
+
+      <ReadingsChart points={filteredHistory} />
 
       <MeterSettingsPanel meter={selectedMeter} onSave={handleSaveMeter} saving={saving} />
     </div>

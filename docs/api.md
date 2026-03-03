@@ -14,6 +14,39 @@
   - `meter_id` (optional, default=`default`)
   - `model_type` (optional, `dummy` or `yolo`, default=`dummy`)
   - `model_name` (optional, YOLOモデル名)
+  - `preprocess` (optional): 前処理設定JSON文字列。`model_type=yolo` のときのみ推論前処理に適用
+
+#### preprocess JSON 例
+```json
+{
+  "brightness": 1.0,
+  "contrast": 1.0,
+  "gamma": 1.0,
+  "sharpness": 1.0,
+  "highlightSuppression": 0.0,
+  "clahe": {
+    "enabled": false,
+    "clipLimit": 2,
+    "tileGridSize": 8
+  },
+  "focus": {
+    "zoom": 1.0,
+    "centerX": 0.5,
+    "centerY": 0.5
+  }
+}
+```
+
+#### preprocess 値域
+- `brightness`: 0.0〜3.0
+- `contrast`: 0.0〜3.0
+- `gamma`: 0.05〜4.0
+- `sharpness`: 0.0〜3.0
+- `highlightSuppression`: 0.0〜1.0
+- `clahe.clipLimit`: 1〜12
+- `clahe.tileGridSize`: 4〜24
+- `focus.zoom`: 1.0〜6.0
+- `focus.centerX`, `focus.centerY`: 0.0〜1.0
 
 #### Response (200)
 ```json
@@ -33,8 +66,25 @@
 ```
 
 #### Error
-- `400`: `image` 不足/空ファイル/不正content-type/不正`model_type`
+- `400`: `image` 不足/空ファイル/不正content-type/不正`model_type`/不正`preprocess`
 - `500`: 画像保存失敗、推論失敗、DB保存失敗
+
+#### curl 例（preprocess未指定）
+```bash
+curl -X POST "http://localhost:5050/api/v1/images" \
+  -F "image=@/path/to/input.jpg" \
+  -F "meter_id=default" \
+  -F "model_type=yolo"
+```
+
+#### curl 例（preprocess指定）
+```bash
+curl -X POST "http://localhost:5050/api/v1/images" \
+  -F "image=@/path/to/input.jpg" \
+  -F "meter_id=default" \
+  -F "model_type=yolo" \
+  -F 'preprocess={"brightness":1.1,"contrast":1.2,"gamma":0.9,"sharpness":1.3,"highlightSuppression":0.6,"clahe":{"enabled":true,"clipLimit":2,"tileGridSize":8},"focus":{"zoom":2.0,"centerX":0.5,"centerY":0.5}}'
+```
 
 ### GET /api/v1/readings/latest
 `meter_id` ごとの最新1件を返す。
