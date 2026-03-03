@@ -2,6 +2,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -42,6 +43,20 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS alert_states (
                 meter_id TEXT PRIMARY KEY,
                 last_notified_ts DATETIME
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stream_readings (
+                id INTEGER PRIMARY KEY,
+                camera_name TEXT NOT NULL,
+                region_id TEXT NOT NULL,
+                region_name TEXT,
+                ts DATETIME NOT NULL,
+                value_text TEXT,
+                value_num REAL,
+                confidence REAL
             )
             """
         )
@@ -243,3 +258,148 @@ def set_last_alert_ts(meter_id: str, ts: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def insert_stream_reading(
+    camera_name: str,
+    region_id: str,
+    region_name: str,
+    value_text: str,
+    confidence: Optional[float] = None,
+) -> Dict[str, object]:
+    ts = datetime.now(timezone.utc).isoformat()
+    value_num = None
+    try:
+        value_num = float(value_text)
+    except (TypeError, ValueError):
+        value_num = None
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO stream_readings
+            (camera_name, region_id, region_name, ts, value_text, value_num, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                camera_name,
+                region_id,
+                region_name,
+                ts,
+                value_text,
+                value_num,
+                confidence,
+            ),
+        )
+        conn.commit()
+        row_id = cursor.lastrowid
+    finally:
+        conn.close()
+
+    return {
+        "id": row_id,
+        "camera_name": camera_name,
+        "region_id": region_id,
+        "region_name": region_name,
+        "ts": ts,
+        "value_text": value_text,
+        "value_num": value_num,
+        "confidence": confidence,
+    }
+
+
+def get_stream_camera_names() -> List[str]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT camera_name
+            FROM stream_readings
+            ORDER BY camera_name ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row["camera_name"]) for row in rows if row["camera_name"]]
+
+
+def get_stream_dates(camera_name: str) -> List[str]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT ts
+            FROM stream_readings
+            WHERE camera_name = ?
+            ORDER BY ts DESC
+            """,
+            (camera_name,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    dates = set()
+    jst = ZoneInfo("Asia/Tokyo")
+    for row in rows:
+        ts = row["ts"]
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dates.add(dt.astimezone(jst).strftime("%Y-%m-%d"))
+        except ValueError:
+            continue
+    return sorted(list(dates), reverse=True)
+
+
+def get_stream_readings(
+    camera_name: str,
+    date: str,
+    region_id: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return []
+
+    jst = ZoneInfo("Asia/Tokyo")
+    day_start_jst = day.replace(tzinfo=jst)
+    day_end_jst = day_start_jst + timedelta(days=1)
+    from_ts = day_start_jst.astimezone(timezone.utc).isoformat()
+    to_ts = day_end_jst.astimezone(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        if region_id:
+            rows = conn.execute(
+                """
+                SELECT id, camera_name, region_id, region_name, ts, value_text, value_num, confidence
+                FROM stream_readings
+                WHERE camera_name = ?
+                  AND region_id = ?
+                  AND ts >= ?
+                  AND ts < ?
+                ORDER BY ts ASC
+                """,
+                (camera_name, region_id, from_ts, to_ts),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, camera_name, region_id, region_name, ts, value_text, value_num, confidence
+                FROM stream_readings
+                WHERE camera_name = ?
+                  AND ts >= ?
+                  AND ts < ?
+                ORDER BY ts ASC
+                """,
+                (camera_name, from_ts, to_ts),
+            ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]

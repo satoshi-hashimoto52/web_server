@@ -20,6 +20,21 @@ export function fetchReadings(meterId, fromTs, toTs) {
   return request(`/api/v1/readings?${params.toString()}`);
 }
 
+export function fetchStreamCameras() {
+  return request('/api/v1/stream/cameras');
+}
+
+export function fetchStreamDates(cameraName) {
+  const params = new URLSearchParams({ camera_name: cameraName });
+  return request(`/api/v1/stream/dates?${params.toString()}`);
+}
+
+export function fetchStreamReadings(cameraName, date, regionId) {
+  const params = new URLSearchParams({ camera_name: cameraName, date });
+  if (regionId) params.set('region_id', regionId);
+  return request(`/api/v1/stream/readings?${params.toString()}`);
+}
+
 export function fetchMeters() {
   return request('/api/v1/meters');
 }

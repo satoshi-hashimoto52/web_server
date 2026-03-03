@@ -8,6 +8,8 @@ import DashboardPage from './DashboardPage';
 
 const REGION_STORAGE_KEY = 'web_server_regions_v1';
 const VIDEO_SETTINGS_STORAGE_KEY = 'stream.video.settings';
+const CAMERA_PROFILES_KEY = 'stream.camera.profiles.v1';
+const ACTIVE_CAMERA_PROFILE_KEY = 'stream.camera.active_profile_id.v1';
 const INFERENCE_RETRY_COUNT = 3;
 const INFERENCE_RETRY_INTERVAL_MS = 150;
 const START_TIMEOUT_MS = 8000;
@@ -67,6 +69,17 @@ const sanitizeVideoSettings = (value) => {
     centerY: clampNumber(asNumber(input.centerY, 0.5), 0, 1),
   };
 };
+
+const sanitizeCameraProfile = (profile, fallbackName = 'default') => ({
+  id: typeof profile?.id === 'string' && profile.id ? profile.id : crypto.randomUUID(),
+  name: typeof profile?.name === 'string' && profile.name.trim() ? profile.name.trim() : fallbackName,
+  sourceType: profile?.sourceType === 'device' ? 'device' : 'url',
+  streamUrl: typeof profile?.streamUrl === 'string' ? profile.streamUrl : '',
+  deviceIndex: typeof profile?.deviceIndex === 'string' ? profile.deviceIndex : '0',
+  model: typeof profile?.model === 'string' ? profile.model : '',
+  regions: Array.isArray(profile?.regions) ? profile.regions : [],
+  videoSettings: sanitizeVideoSettings(profile?.videoSettings),
+});
 
 const applyBasicAdjustments = (data, brightness, contrast, gamma) => {
   const invGamma = 1 / Math.max(gamma, 0.05);
@@ -211,6 +224,9 @@ function App() {
   const [deviceIndex, setDeviceIndex] = useState('0');
   const [modelOptions, setModelOptions] = useState([]);
   const [selectedModel, setSelectedModel] = useState('');
+  const [cameraProfiles, setCameraProfiles] = useState([]);
+  const [activeCameraProfileId, setActiveCameraProfileId] = useState('');
+  const [showCameraSettingsDetails, setShowCameraSettingsDetails] = useState(false);
   const [imageData, setImageData] = useState('');
   const [regions, setRegions] = useState([]);
   const [regionValues, setRegionValues] = useState({});
@@ -274,6 +290,8 @@ function App() {
       }))
       .filter((region) => region.w > 0 && region.h > 0);
   };
+  const activeCameraProfile = cameraProfiles.find((p) => p.id === activeCameraProfileId) || null;
+  const activeCameraName = activeCameraProfile?.name || 'default';
 
   const setConnectionStatus = (nextState, message = '') => {
     connectionStateRef.current = nextState;
@@ -362,6 +380,7 @@ function App() {
       socket.send(JSON.stringify({
         type: 'start',
         source: target,
+        cameraName: activeCameraName,
         regions,
         model: selectedModel || undefined,
         preprocess: toPreprocessPayload(videoSettings),
@@ -548,29 +567,65 @@ function App() {
   }, [selectedModel]);
 
   useEffect(() => {
-    const raw = window.localStorage.getItem(REGION_STORAGE_KEY);
-    if (!raw) return;
+    const legacyRegionsRaw = window.localStorage.getItem(REGION_STORAGE_KEY);
+    const legacySettingsRaw = window.localStorage.getItem(VIDEO_SETTINGS_STORAGE_KEY);
+    let legacyRegions = [];
+    let legacySettings = DEFAULT_VIDEO_SETTINGS;
     try {
-      const parsed = JSON.parse(raw);
-      const next = sanitizeRegions(parsed);
-      if (next.length > 0) {
-        setRegions(next);
-      }
+      legacyRegions = sanitizeRegions(JSON.parse(legacyRegionsRaw || '[]'));
     } catch (error) {
       console.warn('Failed to parse stored regions', error);
     }
-  }, []);
-
-  useEffect(() => {
-    const raw = window.localStorage.getItem(VIDEO_SETTINGS_STORAGE_KEY);
-    if (!raw) return;
     try {
-      const parsed = JSON.parse(raw);
-      setVideoSettings(sanitizeVideoSettings(parsed));
+      legacySettings = sanitizeVideoSettings(JSON.parse(legacySettingsRaw || '{}'));
     } catch (error) {
       console.warn('Failed to parse video settings', error);
     }
+
+    const rawProfiles = window.localStorage.getItem(CAMERA_PROFILES_KEY);
+    let profiles = [];
+    if (rawProfiles) {
+      try {
+        const parsed = JSON.parse(rawProfiles);
+        profiles = Array.isArray(parsed)
+          ? parsed.map((p) => sanitizeCameraProfile(
+            { ...p, regions: sanitizeRegions(p?.regions || []) },
+            p?.name || 'camera'
+          ))
+          : [];
+      } catch (error) {
+        console.warn('Failed to parse camera profiles', error);
+      }
+    }
+    if (profiles.length === 0) {
+      profiles = [sanitizeCameraProfile({
+        id: crypto.randomUUID(),
+        name: 'default',
+        sourceType: 'url',
+        streamUrl: '',
+        deviceIndex: '0',
+        model: '',
+        regions: legacyRegions,
+        videoSettings: legacySettings,
+      }, 'default')];
+    }
+
+    const storedActiveId = window.localStorage.getItem(ACTIVE_CAMERA_PROFILE_KEY) || '';
+    const activeId = profiles.some((p) => p.id === storedActiveId) ? storedActiveId : profiles[0].id;
+
+    setCameraProfiles(profiles);
+    setActiveCameraProfileId(activeId);
   }, []);
+
+  useEffect(() => {
+    if (!activeCameraProfile) return;
+    setSourceType(activeCameraProfile.sourceType);
+    setStreamUrl(activeCameraProfile.streamUrl);
+    setDeviceIndex(activeCameraProfile.deviceIndex);
+    setRegions(sanitizeRegions(activeCameraProfile.regions));
+    setVideoSettings(sanitizeVideoSettings(activeCameraProfile.videoSettings));
+    setSelectedModel(activeCameraProfile.model || modelOptions[0] || '');
+  }, [activeCameraProfileId, modelOptions]);
 
   const stopStream = () => {
     desiredStreamingRef.current = false;
@@ -688,6 +743,55 @@ function App() {
     setVideoSettings(DEFAULT_VIDEO_SETTINGS);
   };
 
+  const createCameraProfile = () => {
+    const name = window.prompt('カメラ設定名を入力してください');
+    if (!name) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (cameraProfiles.some((p) => p.name === trimmed)) {
+      alert('同じ名前のカメラ設定は作成できません。');
+      return;
+    }
+    const newProfile = sanitizeCameraProfile({
+      id: crypto.randomUUID(),
+      name: trimmed,
+      sourceType: 'url',
+      streamUrl: '',
+      deviceIndex: '0',
+      model: selectedModel || '',
+      regions: [],
+      videoSettings: DEFAULT_VIDEO_SETTINGS,
+    }, trimmed);
+    setCameraProfiles((prev) => [...prev, newProfile]);
+    setActiveCameraProfileId(newProfile.id);
+    setShowCameraSettingsDetails(true);
+  };
+
+  const deleteCameraProfile = () => {
+    if (cameraProfiles.length <= 1) {
+      alert('最後の1件は削除できません。');
+      return;
+    }
+    const target = activeCameraProfile;
+    if (!target) return;
+    if (!window.confirm(`カメラ設定「${target.name}」を削除しますか？`)) return;
+    const nextProfiles = cameraProfiles.filter((p) => p.id !== target.id);
+    setCameraProfiles(nextProfiles);
+    setActiveCameraProfileId(nextProfiles[0]?.id || '');
+  };
+
+  const updateActiveCameraProfileName = (name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (cameraProfiles.some((p) => p.id !== activeCameraProfileId && p.name === trimmed)) {
+      alert('同じ名前のカメラ設定は使用できません。');
+      return;
+    }
+    setCameraProfiles((prev) => prev.map((profile) => (
+      profile.id === activeCameraProfileId ? { ...profile, name: trimmed } : profile
+    )));
+  };
+
   const handleStreamClick = (event) => {
     if (!streamRef.current) return;
     const rect = streamRef.current.getBoundingClientRect();
@@ -736,7 +840,7 @@ function App() {
           const frameBlob = await captureCurrentFrameBlob();
           const formData = new FormData();
           formData.append('image', frameBlob, `stream_frame_${Date.now()}_${i + 1}.jpg`);
-          formData.append('meter_id', 'default');
+          formData.append('meter_id', activeCameraName);
           formData.append('model_type', 'yolo');
           formData.append('preprocess', preprocessPayload);
 
@@ -926,6 +1030,41 @@ function App() {
   }, [selectedModel, isStreaming]);
 
   useEffect(() => {
+    if (!activeCameraProfileId) return;
+    setCameraProfiles((prev) => prev.map((profile) => (
+      profile.id === activeCameraProfileId
+        ? {
+            ...profile,
+            sourceType,
+            streamUrl,
+            deviceIndex,
+            model: selectedModel,
+            regions,
+            videoSettings,
+          }
+        : profile
+    )));
+  }, [
+    activeCameraProfileId,
+    sourceType,
+    streamUrl,
+    deviceIndex,
+    selectedModel,
+    regions,
+    videoSettings,
+  ]);
+
+  useEffect(() => {
+    if (!cameraProfiles.length) return;
+    window.localStorage.setItem(CAMERA_PROFILES_KEY, JSON.stringify(cameraProfiles));
+  }, [cameraProfiles]);
+
+  useEffect(() => {
+    if (!activeCameraProfileId) return;
+    window.localStorage.setItem(ACTIVE_CAMERA_PROFILE_KEY, activeCameraProfileId);
+  }, [activeCameraProfileId]);
+
+  useEffect(() => {
     if (!isStreaming) return;
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
     ws.current.send(JSON.stringify({
@@ -934,14 +1073,6 @@ function App() {
       previewPreprocess: showVideoSettings,
     }));
   }, [videoSettings, isStreaming, showVideoSettings]);
-
-  useEffect(() => {
-    if (!regions.length) {
-      window.localStorage.removeItem(REGION_STORAGE_KEY);
-      return;
-    }
-    window.localStorage.setItem(REGION_STORAGE_KEY, JSON.stringify(regions));
-  }, [regions]);
 
   useEffect(() => {
     activeTabRef.current = activeTab;
@@ -968,7 +1099,6 @@ function App() {
 
   useEffect(() => {
     settingsVersionRef.current += 1;
-    window.localStorage.setItem(VIDEO_SETTINGS_STORAGE_KEY, JSON.stringify(videoSettings));
   }, [videoSettings]);
 
   useEffect(() => {
@@ -1032,90 +1162,135 @@ function App() {
       ) : (
         <>
           <header className="hero">
-            <p className="eyebrow">Realtime Vision</p>
-            <h2>Live Stream Viewer</h2>
-            <p className="subhead">
-              カメラまたはストリームURLに接続して、YOLOv8の検出結果をリアルタイムで確認できます。
-            </p>
-          </header>
-          <form className="panel" onSubmit={(event) => event.preventDefault()}>
-            <div className="controls">
-              <label className="field">
-                <span>入力ソース</span>
-                <select
-                  value={sourceType}
-                  onChange={(e) => setSourceType(e.target.value)}
-                >
-                  <option value="url">HTTP/RTSP URL</option>
-                  <option value="device">Macbook カメラ</option>
-                </select>
-              </label>
-              {sourceType === 'url' ? (
-                <label className="field field-wide">
-                  <span>ストリームURL</span>
-                  <input
-                    type="text"
-                    value={streamUrl}
-                    placeholder="http:// または rtsp://"
-                    onChange={(e) => setStreamUrl(e.target.value)}
-                    required
-                  />
-                </label>
-              ) : (
-                <label className="field field-wide">
-                  <span>デバイス</span>
-                  <select
-                    value={deviceIndex}
-                    onChange={(e) => setDeviceIndex(e.target.value)}
+            <div className="hero-layout">
+              <div className="hero-copy">
+                <p className="eyebrow">Realtime Vision</p>
+                <h2>Live Stream Viewer</h2>
+                <p className="subhead">
+                  カメラまたはストリームURLに接続して、YOLOv8の検出結果をリアルタイムで確認できます。
+                </p>
+              </div>
+              <form className="panel hero-settings" onSubmit={(event) => event.preventDefault()}>
+                <div className="controls">
+                  <label className="field">
+                    <span>カメラ設定</span>
+                    <select
+                      value={activeCameraProfileId}
+                      onChange={(e) => setActiveCameraProfileId(e.target.value)}
+                    >
+                      {cameraProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    className={`secondary details-toggle${showCameraSettingsDetails ? ' active' : ''}`}
+                    type="button"
+                    onClick={() => setShowCameraSettingsDetails((prev) => !prev)}
                   >
-                    <option value="0">デバイス0（既定）</option>
-                    <option value="1">デバイス1</option>
-                  </select>
-                </label>
-              )}
-              <label className="field">
-                <span>モデル</span>
-                <select
-                  value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                >
-                  {modelOptions.length === 0 ? (
-                    <option value="">読み込み中</option>
-                  ) : (
-                    modelOptions.map((name) => (
-                      <option key={name} value={name}>{name}</option>
-                    ))
-                  )}
-                </select>
-              </label>
-              <button
-                className={`primary ${isStreaming ? 'danger' : ''}`}
-                type="button"
-                onClick={() => (isStreaming ? stopStream() : startStream())}
-                disabled={connectionState === 'connecting' || connectionState === 'stopping'}
-              >
-                {connectionState === 'connecting'
-                  ? '接続中...'
-                  : connectionState === 'stopping'
-                    ? '停止中...'
-                    : isStreaming
-                      ? '停止'
-                      : 'ストリーム開始'}
-              </button>
+                    {showCameraSettingsDetails ? '▲ 設定詳細' : '▼ 設定詳細'}
+                  </button>
+                  <button
+                    className={`primary ${isStreaming ? 'danger' : ''}`}
+                    type="button"
+                    onClick={() => (isStreaming ? stopStream() : startStream())}
+                    disabled={connectionState === 'connecting' || connectionState === 'stopping'}
+                  >
+                    {connectionState === 'connecting'
+                      ? '接続中...'
+                      : connectionState === 'stopping'
+                        ? '停止中...'
+                        : isStreaming
+                          ? '停止'
+                          : 'ストリーム開始'}
+                  </button>
+                </div>
+                {showCameraSettingsDetails && (
+                  <div className="camera-settings-panel">
+                    <label className="field">
+                      <span>設定名</span>
+                      <input
+                        type="text"
+                        key={activeCameraProfileId}
+                        defaultValue={activeCameraName}
+                        onBlur={(e) => updateActiveCameraProfileName(e.target.value)}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>入力ソース</span>
+                      <select
+                        value={sourceType}
+                        onChange={(e) => setSourceType(e.target.value)}
+                      >
+                        <option value="url">HTTP/RTSP URL</option>
+                        <option value="device">Macbook カメラ</option>
+                      </select>
+                    </label>
+                    {sourceType === 'url' ? (
+                      <label className="field field-wide">
+                        <span>ストリームURL</span>
+                        <input
+                          type="text"
+                          value={streamUrl}
+                          placeholder="http:// または rtsp://"
+                          onChange={(e) => setStreamUrl(e.target.value)}
+                          required
+                        />
+                      </label>
+                    ) : (
+                      <label className="field field-wide">
+                        <span>デバイス</span>
+                        <select
+                          value={deviceIndex}
+                          onChange={(e) => setDeviceIndex(e.target.value)}
+                        >
+                          <option value="0">デバイス0（既定）</option>
+                          <option value="1">デバイス1</option>
+                        </select>
+                      </label>
+                    )}
+                    <label className="field">
+                      <span>モデル</span>
+                      <select
+                        value={selectedModel}
+                        onChange={(e) => setSelectedModel(e.target.value)}
+                      >
+                        {modelOptions.length === 0 ? (
+                          <option value="">読み込み中</option>
+                        ) : (
+                          modelOptions.map((name) => (
+                            <option key={name} value={name}>{name}</option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                    <div className="camera-settings-actions">
+                      <button className="secondary" type="button" onClick={createCameraProfile}>
+                        設定を作成 +
+                      </button>
+                      <button className="secondary" type="button" onClick={deleteCameraProfile}>
+                        設定を削除
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {(connectionState !== 'idle' || connectionMessage) && (
+                  <p className={`muted connection-line state-${connectionState}`}>
+                    状態: {connectionState}
+                    {connectionMessage ? ` / ${connectionMessage}` : ''}
+                  </p>
+                )}
+              </form>
             </div>
-            {(connectionState !== 'idle' || connectionMessage) && (
-              <p className={`muted connection-line state-${connectionState}`}>
-                状態: {connectionState}
-                {connectionMessage ? ` / ${connectionMessage}` : ''}
-              </p>
-            )}
-          </form>
+          </header>
           {/* 映像受信中/受信待ち中はプレビュー領域を表示 */}
           {(imageData || isStreaming) && (
             <div className="preview">
               <div className="stream-column">
                 <div className="stream-header">
-                  <h3>エリア_カメラ</h3>
+                  <h3>{activeCameraName}</h3>
                   <div className="stream-actions">
                     <button className="ghost" type="button" onClick={addRegion}>
                       領域作成 +

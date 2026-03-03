@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -24,8 +25,12 @@ from db import (
     get_meter_by_id,
     get_meters,
     get_readings,
+    get_stream_camera_names,
+    get_stream_dates,
+    get_stream_readings,
     init_db,
     insert_reading,
+    insert_stream_reading,
     set_last_alert_ts,
     upsert_meter,
 )
@@ -425,6 +430,45 @@ def api_upsert_meter(meter_id: str, payload: MeterUpsertRequest):
     return row
 
 
+@app.get("/api/v1/stream/cameras")
+def api_get_stream_cameras():
+    try:
+        return {"cameras": get_stream_camera_names()}
+    except Exception:
+        logger.exception("failed to fetch stream cameras")
+        raise HTTPException(status_code=500, detail="failed to fetch stream cameras")
+
+
+@app.get("/api/v1/stream/dates")
+def api_get_stream_dates(camera_name: str = Query(...)):
+    name = (camera_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="camera_name is required")
+    try:
+        return {"dates": get_stream_dates(name)}
+    except Exception:
+        logger.exception("failed to fetch stream dates")
+        raise HTTPException(status_code=500, detail="failed to fetch stream dates")
+
+
+@app.get("/api/v1/stream/readings")
+def api_get_stream_readings(
+    camera_name: str = Query(...),
+    date: str = Query(...),
+    region_id: Optional[str] = Query(None),
+):
+    name = (camera_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="camera_name is required")
+    target_region = (region_id or "").strip() or None
+    try:
+        rows = get_stream_readings(name, date, target_region)
+    except Exception:
+        logger.exception("failed to fetch stream readings")
+        raise HTTPException(status_code=500, detail="failed to fetch stream readings")
+    return rows
+
+
 @app.get("/models")
 def list_models():
     models = []
@@ -444,6 +488,8 @@ async def websocket_stream(websocket: WebSocket):
     model_name = MODEL_FILENAME
     preprocess_config = None
     preview_preprocess = False
+    camera_name = "default"
+    region_log_state = {}
     should_stop = False
     stop_reason = ""
 
@@ -481,6 +527,7 @@ async def websocket_stream(websocket: WebSocket):
             if isinstance(payload, dict) and payload.get("type") == "start":
                 stream_url = payload.get("source", "")
                 regions = payload.get("regions", []) or []
+                camera_name = str(payload.get("cameraName") or stream_url or "default")
                 if payload.get("model"):
                     resolved = resolve_model_name(payload.get("model"))
                     if resolved:
@@ -598,8 +645,33 @@ async def websocket_stream(websocket: WebSocket):
                     )
                 results_payload.append({
                     "id": region.get("id"),
+                    "name": region.get("name"),
                     "value": value,
                 })
+
+                region_id = str(region.get("id") or "")
+                region_name = str(region.get("name") or "")
+                if region_id and value:
+                    now_ts = time.time()
+                    last_state = region_log_state.get(region_id)
+                    should_log = False
+                    if not last_state:
+                        should_log = True
+                    else:
+                        value_changed = last_state.get("value") != value
+                        elapsed = now_ts - float(last_state.get("ts", 0.0))
+                        should_log = value_changed or elapsed >= 1.0
+                    if should_log:
+                        try:
+                            insert_stream_reading(
+                                camera_name=camera_name,
+                                region_id=region_id,
+                                region_name=region_name,
+                                value_text=value,
+                            )
+                            region_log_state[region_id] = {"value": value, "ts": now_ts}
+                        except Exception:
+                            logger.exception("failed to save stream reading")
 
             # JPEG エンコード → Base64
             _, buffer = cv2.imencode('.jpg', display_frame)
