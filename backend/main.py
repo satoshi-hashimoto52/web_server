@@ -109,6 +109,7 @@ def _parse_preprocess(raw: Optional[str]) -> Optional[Dict[str, Any]]:
     gamma = _to_float(payload.get("gamma", 1.0), "gamma")
     sharpness = _to_float(payload.get("sharpness", 1.0), "sharpness")
     highlight_suppression = _to_float(payload.get("highlightSuppression", 0.0), "highlightSuppression")
+    highlight_recovery = _to_float(payload.get("highlightRecovery", 0.0), "highlightRecovery")
 
     if not 0.0 <= brightness <= 3.0:
         raise HTTPException(status_code=400, detail="invalid preprocess: brightness")
@@ -120,6 +121,8 @@ def _parse_preprocess(raw: Optional[str]) -> Optional[Dict[str, Any]]:
         raise HTTPException(status_code=400, detail="invalid preprocess: sharpness")
     if not 0.0 <= highlight_suppression <= 1.0:
         raise HTTPException(status_code=400, detail="invalid preprocess: highlightSuppression")
+    if not 0.0 <= highlight_recovery <= 1.0:
+        raise HTTPException(status_code=400, detail="invalid preprocess: highlightRecovery")
 
     clahe_payload = payload.get("clahe", {})
     if clahe_payload is None:
@@ -155,6 +158,7 @@ def _parse_preprocess(raw: Optional[str]) -> Optional[Dict[str, Any]]:
         "gamma": _clamp(gamma, 0.05, 4.0),
         "sharpness": _clamp(sharpness, 0.0, 3.0),
         "highlightSuppression": _clamp(highlight_suppression, 0.0, 1.0),
+        "highlightRecovery": _clamp(highlight_recovery, 0.0, 1.0),
         "clahe": {
             "enabled": clahe_enabled,
             "clipLimit": _clamp(clahe_clip_limit, 1.0, 12.0),
@@ -197,18 +201,29 @@ def _draw_detections_overlay(frame, detections, model_name: str):
             1,
         )
 
+
+def _draw_stream_metrics_overlay(frame, model_name: str, fps: float):
     model_label = f"Model: {model_name}"
-    text_org = (12, 34)
+    model_text_org = (12, 34)
+    fps_label = f"FPS: {fps:.1f}" if fps > 0 else "FPS: -"
+    fps_text_org = (12, max(24, frame.shape[0] - 14))
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.9
-    cv2.putText(frame, model_label, text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
-    cv2.putText(frame, model_label, text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, model_label, model_text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(frame, model_label, model_text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, fps_label, fps_text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(frame, fps_label, fps_text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
 
 
 class MeterUpsertRequest(BaseModel):
     threshold_high: Optional[float] = None
     threshold_low: Optional[float] = None
     enabled: Optional[bool] = None
+    fetch_interval_sec: Optional[int] = None
+    anomaly_confirm_count: Optional[int] = None
+    notify_cooldown_minutes: Optional[int] = None
+    status_delay_seconds: Optional[int] = None
+    status_down_seconds: Optional[int] = None
 
 
 def _parse_iso_datetime(value: str) -> Optional[datetime]:
@@ -223,14 +238,14 @@ def _parse_iso_datetime(value: str) -> Optional[datetime]:
         return None
 
 
-def _should_send_alert_by_time(meter_id: str) -> bool:
+def _should_send_alert_by_time(meter_id: str, cooldown_minutes: int = ALERT_SUPPRESS_MINUTES) -> bool:
     last_ts = get_last_alert_ts(meter_id)
     if not last_ts:
         return True
     last_dt = _parse_iso_datetime(last_ts)
     if not last_dt:
         return True
-    return datetime.now(timezone.utc) - last_dt >= timedelta(minutes=ALERT_SUPPRESS_MINUTES)
+    return datetime.now(timezone.utc) - last_dt >= timedelta(minutes=max(cooldown_minutes, 0))
 
 
 def _post_to_slack(text: str) -> bool:
@@ -272,13 +287,18 @@ def _maybe_send_threshold_alert(reading: dict) -> bool:
 
     threshold_high = meter.get("threshold_high")
     threshold_low = meter.get("threshold_low")
+    try:
+        cooldown_minutes = int(meter.get("notify_cooldown_minutes") or ALERT_SUPPRESS_MINUTES)
+    except (TypeError, ValueError):
+        cooldown_minutes = ALERT_SUPPRESS_MINUTES
+    cooldown_minutes = max(cooldown_minutes, 0)
     over_high = threshold_high is not None and value_float > float(threshold_high)
     under_low = threshold_low is not None and value_float < float(threshold_low)
     if not over_high and not under_low:
         return False
 
-    if not _should_send_alert_by_time(meter_id):
-        logger.info("suppress alert meter_id=%s within %s minutes", meter_id, ALERT_SUPPRESS_MINUTES)
+    if not _should_send_alert_by_time(meter_id, cooldown_minutes):
+        logger.info("suppress alert meter_id=%s within %s minutes", meter_id, cooldown_minutes)
         return False
 
     reason = "HIGH" if over_high else "LOW"
@@ -423,6 +443,11 @@ def api_upsert_meter(meter_id: str, payload: MeterUpsertRequest):
             threshold_high=payload.threshold_high,
             threshold_low=payload.threshold_low,
             enabled=payload.enabled,
+            fetch_interval_sec=payload.fetch_interval_sec,
+            anomaly_confirm_count=payload.anomaly_confirm_count,
+            notify_cooldown_minutes=payload.notify_cooldown_minutes,
+            status_delay_seconds=payload.status_delay_seconds,
+            status_down_seconds=payload.status_down_seconds,
         )
     except Exception:
         logger.exception("failed to upsert meter")
@@ -492,6 +517,8 @@ async def websocket_stream(websocket: WebSocket):
     region_log_state = {}
     should_stop = False
     stop_reason = ""
+    previous_frame_time = None
+    fps_ema = 0.0
 
     async def send_status(state: str, message: str = ""):
         payload = {"type": "status", "state": state}
@@ -568,6 +595,17 @@ async def websocket_stream(websocket: WebSocket):
             if not success:
                 break
 
+            frame_now = time.time()
+            if previous_frame_time is not None:
+                delta = frame_now - previous_frame_time
+                if delta > 0:
+                    instant_fps = 1.0 / delta
+                    if fps_ema <= 0:
+                        fps_ema = instant_fps
+                    else:
+                        fps_ema = fps_ema * 0.88 + instant_fps * 0.12
+            previous_frame_time = frame_now
+
             # 領域更新の受信（あれば反映）
             try:
                 update_message = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
@@ -613,6 +651,7 @@ async def websocket_stream(websocket: WebSocket):
             else:
                 display_frame = frame
                 _draw_detections_overlay(display_frame, detections, model_name)
+            _draw_stream_metrics_overlay(display_frame, model_name, fps_ema)
 
             # 領域ごとの検出結果（左から結合）
             height, width = display_frame.shape[:2]

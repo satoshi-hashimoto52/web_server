@@ -9,6 +9,21 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 
 
+def _ensure_meter_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(meters)").fetchall()
+    existing = {str(row[1]) for row in rows}
+    additions = [
+        ("fetch_interval_sec", "INTEGER"),
+        ("anomaly_confirm_count", "INTEGER"),
+        ("notify_cooldown_minutes", "INTEGER"),
+        ("status_delay_seconds", "INTEGER"),
+        ("status_down_seconds", "INTEGER"),
+    ]
+    for name, col_type in additions:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE meters ADD COLUMN {name} {col_type}")
+
+
 def init_db() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -34,10 +49,16 @@ def init_db() -> None:
                 location TEXT,
                 threshold_high REAL,
                 threshold_low REAL,
-                enabled INTEGER
+                enabled INTEGER,
+                fetch_interval_sec INTEGER,
+                anomaly_confirm_count INTEGER,
+                notify_cooldown_minutes INTEGER,
+                status_delay_seconds INTEGER,
+                status_down_seconds INTEGER
             )
             """
         )
+        _ensure_meter_columns(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS alert_states (
@@ -155,7 +176,18 @@ def get_meters() -> List[Dict[str, object]]:
     try:
         rows = conn.execute(
             """
-            SELECT meter_id, name, location, threshold_high, threshold_low, enabled
+            SELECT
+                meter_id,
+                name,
+                location,
+                threshold_high,
+                threshold_low,
+                enabled,
+                fetch_interval_sec,
+                anomaly_confirm_count,
+                notify_cooldown_minutes,
+                status_delay_seconds,
+                status_down_seconds
             FROM meters
             ORDER BY meter_id ASC
             """
@@ -170,6 +202,11 @@ def upsert_meter(
     threshold_high: Optional[float],
     threshold_low: Optional[float],
     enabled: Optional[bool],
+    fetch_interval_sec: Optional[int] = None,
+    anomaly_confirm_count: Optional[int] = None,
+    notify_cooldown_minutes: Optional[int] = None,
+    status_delay_seconds: Optional[int] = None,
+    status_down_seconds: Optional[int] = None,
 ) -> Dict[str, object]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -177,12 +214,19 @@ def upsert_meter(
         conn.execute(
             """
             INSERT INTO meters (
-                meter_id, name, location, threshold_high, threshold_low, enabled
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                meter_id, name, location, threshold_high, threshold_low, enabled,
+                fetch_interval_sec, anomaly_confirm_count, notify_cooldown_minutes,
+                status_delay_seconds, status_down_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(meter_id) DO UPDATE SET
                 threshold_high = COALESCE(excluded.threshold_high, meters.threshold_high),
                 threshold_low = COALESCE(excluded.threshold_low, meters.threshold_low),
-                enabled = COALESCE(excluded.enabled, meters.enabled)
+                enabled = COALESCE(excluded.enabled, meters.enabled),
+                fetch_interval_sec = COALESCE(excluded.fetch_interval_sec, meters.fetch_interval_sec),
+                anomaly_confirm_count = COALESCE(excluded.anomaly_confirm_count, meters.anomaly_confirm_count),
+                notify_cooldown_minutes = COALESCE(excluded.notify_cooldown_minutes, meters.notify_cooldown_minutes),
+                status_delay_seconds = COALESCE(excluded.status_delay_seconds, meters.status_delay_seconds),
+                status_down_seconds = COALESCE(excluded.status_down_seconds, meters.status_down_seconds)
             """,
             (
                 meter_id,
@@ -191,12 +235,28 @@ def upsert_meter(
                 threshold_high,
                 threshold_low,
                 1 if enabled is True else 0 if enabled is False else None,
+                fetch_interval_sec,
+                anomaly_confirm_count,
+                notify_cooldown_minutes,
+                status_delay_seconds,
+                status_down_seconds,
             ),
         )
         conn.commit()
         row = conn.execute(
             """
-            SELECT meter_id, name, location, threshold_high, threshold_low, enabled
+            SELECT
+                meter_id,
+                name,
+                location,
+                threshold_high,
+                threshold_low,
+                enabled,
+                fetch_interval_sec,
+                anomaly_confirm_count,
+                notify_cooldown_minutes,
+                status_delay_seconds,
+                status_down_seconds
             FROM meters
             WHERE meter_id = ?
             """,
@@ -213,7 +273,18 @@ def get_meter_by_id(meter_id: str) -> Optional[Dict[str, object]]:
     try:
         row = conn.execute(
             """
-            SELECT meter_id, name, location, threshold_high, threshold_low, enabled
+            SELECT
+                meter_id,
+                name,
+                location,
+                threshold_high,
+                threshold_low,
+                enabled,
+                fetch_interval_sec,
+                anomaly_confirm_count,
+                notify_cooldown_minutes,
+                status_delay_seconds,
+                status_down_seconds
             FROM meters
             WHERE meter_id = ?
             """,

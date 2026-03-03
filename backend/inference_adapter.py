@@ -111,6 +111,28 @@ def _apply_highlight_suppression(frame: np.ndarray, strength: float) -> np.ndarr
     return cv2.cvtColor(merged.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
+def _apply_highlight_recovery(frame: np.ndarray, strength: float) -> np.ndarray:
+    strength = max(0.0, min(float(strength), 1.0))
+    if strength <= 0.0:
+        return frame
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2].astype(np.float32)
+    s_channel = hsv[:, :, 1].astype(np.float32)
+    bright_mask = ((v_channel >= 210.0) & (s_channel <= 140.0)).astype(np.uint8) * 255
+    if not np.any(bright_mask):
+        return frame
+
+    kernel = np.ones((3, 3), np.uint8)
+    expanded_mask = cv2.dilate(bright_mask, kernel, iterations=1)
+    inpainted = cv2.inpaint(frame, expanded_mask, 3.0, cv2.INPAINT_TELEA)
+    blend = 0.2 + 0.75 * strength
+    recovered = cv2.addWeighted(frame, 1.0 - blend, inpainted, blend, 0.0)
+    output = frame.copy()
+    output[expanded_mask > 0] = recovered[expanded_mask > 0]
+    return output
+
+
 def apply_preprocess(frame: np.ndarray, preprocess: Optional[Dict[str, object]]) -> np.ndarray:
     if not preprocess:
         return frame
@@ -122,9 +144,11 @@ def apply_preprocess(frame: np.ndarray, preprocess: Optional[Dict[str, object]])
     gamma = float(preprocess.get("gamma", 1.0))
     sharpness = float(preprocess.get("sharpness", 1.0))
     highlight_suppression = float(preprocess.get("highlightSuppression", 0.0))
+    highlight_recovery = float(preprocess.get("highlightRecovery", 0.0))
 
     output = _apply_focus(frame, focus)
     output = _apply_highlight_suppression(output, highlight_suppression)
+    output = _apply_highlight_recovery(output, highlight_recovery)
     output = _apply_clahe(output, clahe)
     output = _apply_brightness_contrast(output, brightness, contrast)
     output = _apply_gamma(output, gamma)

@@ -16,12 +16,15 @@ const START_TIMEOUT_MS = 8000;
 const FIRST_FRAME_TIMEOUT_MS = 8000;
 const FRAME_STALL_TIMEOUT_MS = 5000;
 const AUTO_RECONNECT_MAX = 2;
+const ADJUSTING_PREVIEW_FPS = 8;
+const ADJUSTING_PREVIEW_INTERVAL_MS = 1000 / ADJUSTING_PREVIEW_FPS;
 const DEFAULT_VIDEO_SETTINGS = Object.freeze({
   brightness: 1,
   contrast: 1,
   gamma: 1,
   sharpness: 1,
   highlightSuppression: 0,
+  highlightRecovery: 0,
   claheEnabled: false,
   claheClipLimit: 2,
   claheTileGridSize: 8,
@@ -37,6 +40,7 @@ const toPreprocessPayload = (settings) => ({
   gamma: settings.gamma,
   sharpness: settings.sharpness,
   highlightSuppression: settings.highlightSuppression,
+  highlightRecovery: settings.highlightRecovery,
   clahe: {
     enabled: settings.claheEnabled,
     clipLimit: settings.claheClipLimit,
@@ -61,6 +65,7 @@ const sanitizeVideoSettings = (value) => {
     gamma: clampNumber(asNumber(input.gamma, 1), 0.05, 4),
     sharpness: clampNumber(asNumber(input.sharpness, 1), 0, 3),
     highlightSuppression: clampNumber(asNumber(input.highlightSuppression, 0), 0, 1),
+    highlightRecovery: clampNumber(asNumber(input.highlightRecovery, 0), 0, 1),
     claheEnabled: Boolean(input.claheEnabled),
     claheClipLimit: clampNumber(asNumber(input.claheClipLimit, 2), 1, 12),
     claheTileGridSize: clampNumber(Math.round(asNumber(input.claheTileGridSize, 8)), 4, 24),
@@ -141,6 +146,75 @@ const applyHighlightSuppression = (data, strength) => {
     data[i] = clampNumber(r * reduce, 0, 255);
     data[i + 1] = clampNumber(g * reduce, 0, 255);
     data[i + 2] = clampNumber(b * reduce, 0, 255);
+  }
+};
+
+const applyHighlightRecovery = (data, width, height, strength) => {
+  if (strength <= 0) return;
+  if (width < 3 || height < 3) return;
+  const src = new Uint8ClampedArray(data);
+  const rowStride = width * 4;
+  const brightThreshold = 210;
+  const satThreshold = 140;
+  const maxRadius = 4;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const idx = y * rowStride + x * 4;
+      const r = src[idx];
+      const g = src[idx + 1];
+      const b = src[idx + 2];
+      const maxCh = Math.max(r, g, b);
+      const sat = maxCh - Math.min(r, g, b);
+      if (maxCh < brightThreshold || sat > satThreshold) continue;
+
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let weightSum = 0;
+      for (let radius = 1; radius <= maxRadius && weightSum < 0.001; radius += 1) {
+        for (let oy = -radius; oy <= radius; oy += 1) {
+          for (let ox = -radius; ox <= radius; ox += 1) {
+            if (ox === 0 && oy === 0) continue;
+            const nx = x + ox;
+            const ny = y + oy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            const nIdx = ny * rowStride + nx * 4;
+            const nr = src[nIdx];
+            const ng = src[nIdx + 1];
+            const nb = src[nIdx + 2];
+            const nMax = Math.max(nr, ng, nb);
+            const nSat = nMax - Math.min(nr, ng, nb);
+            if (nMax >= 245 && nSat <= satThreshold) continue;
+            const dist2 = ox * ox + oy * oy;
+            const weight = 1 / Math.max(1, dist2);
+            sumR += nr * weight;
+            sumG += ng * weight;
+            sumB += nb * weight;
+            weightSum += weight;
+          }
+        }
+      }
+      if (weightSum <= 0) continue;
+
+      const avgR = sumR / weightSum;
+      const avgG = sumG / weightSum;
+      const avgB = sumB / weightSum;
+      const over = clampNumber((maxCh - brightThreshold) / (255 - brightThreshold), 0, 1);
+      const mix = strength * (0.45 + over * 0.55);
+
+      const restoredR = r * (1 - mix) + avgR * mix;
+      const restoredG = g * (1 - mix) + avgG * mix;
+      const restoredB = b * (1 - mix) + avgB * mix;
+      const currentLuma = 0.299 * restoredR + 0.587 * restoredG + 0.114 * restoredB;
+      const neighborLuma = 0.299 * avgR + 0.587 * avgG + 0.114 * avgB;
+      const targetLuma = (0.299 * r + 0.587 * g + 0.114 * b) * (1 - 0.28 * mix) + neighborLuma * (0.28 * mix);
+      const lumaScale = currentLuma > 1 ? targetLuma / currentLuma : 1;
+
+      data[idx] = clampNumber(restoredR * lumaScale, 0, 255);
+      data[idx + 1] = clampNumber(restoredG * lumaScale, 0, 255);
+      data[idx + 2] = clampNumber(restoredB * lumaScale, 0, 255);
+    }
   }
 };
 
@@ -258,6 +332,8 @@ function App() {
   const lastFrameAtRef = useRef(0);
   const autoReconnectCountRef = useRef(0);
   const desiredStreamingRef = useRef(false);
+  const showVideoSettingsRef = useRef(false);
+  const lastDisplayFrameAtRef = useRef(0);
   const imageVersionRef = useRef(0);
   const settingsVersionRef = useRef(0);
   const drawStateRef = useRef({
@@ -292,6 +368,14 @@ function App() {
   };
   const activeCameraProfile = cameraProfiles.find((p) => p.id === activeCameraProfileId) || null;
   const activeCameraName = activeCameraProfile?.name || 'default';
+
+  const shouldUpdateDisplayFrame = () => {
+    if (!showVideoSettingsRef.current) return true;
+    const now = performance.now();
+    if (now - lastDisplayFrameAtRef.current < ADJUSTING_PREVIEW_INTERVAL_MS) return false;
+    lastDisplayFrameAtRef.current = now;
+    return true;
+  };
 
   const setConnectionStatus = (nextState, message = '') => {
     connectionStateRef.current = nextState;
@@ -466,7 +550,9 @@ function App() {
             setIsStreaming(true);
           }
           if (activeTabRef.current === 'stream') {
-            setImageData(frameData);
+            if (shouldUpdateDisplayFrame()) {
+              setImageData(frameData);
+            }
           }
         }
         if (Array.isArray(payload.results)) {
@@ -502,7 +588,9 @@ function App() {
         setIsStreaming(true);
       }
       if (activeTabRef.current === 'stream') {
-        setImageData(frameData);
+        if (shouldUpdateDisplayFrame()) {
+          setImageData(frameData);
+        }
       }
     };
 
@@ -925,7 +1013,7 @@ function App() {
     }
   };
 
-  const drawAdjustedFrame = (ctx, canvas, image) => {
+  const drawAdjustedFrame = (ctx, canvas, image, settings) => {
     const sourceWidth = image.naturalWidth || image.videoWidth || image.width;
     const sourceHeight = image.naturalHeight || image.videoHeight || image.height;
     if (!sourceWidth || !sourceHeight) return;
@@ -934,6 +1022,29 @@ function App() {
       canvas.height = sourceHeight;
     }
     ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+    if (!settings) return;
+    const hasAdjustments = (
+      Math.abs(settings.brightness - 1) > 0.001
+      || Math.abs(settings.contrast - 1) > 0.001
+      || Math.abs(settings.gamma - 1) > 0.001
+      || Math.abs(settings.sharpness) > 0.001
+      || Math.abs(settings.highlightSuppression) > 0.001
+      || Math.abs(settings.highlightRecovery) > 0.001
+      || Boolean(settings.claheEnabled)
+    );
+    if (!hasAdjustments) return;
+
+    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const data = frame.data;
+    applyBasicAdjustments(data, settings.brightness, settings.contrast, settings.gamma);
+    applyHighlightRecovery(data, canvas.width, canvas.height, settings.highlightRecovery);
+    applyHighlightSuppression(data, settings.highlightSuppression);
+    if (settings.claheEnabled) {
+      applyClaheToLuma(data, canvas.width, canvas.height, settings.claheClipLimit, settings.claheTileGridSize);
+    }
+    applySharpen(data, canvas.width, canvas.height, settings.sharpness);
+    ctx.putImageData(frame, 0, 0);
   };
 
   useEffect(() => {
@@ -1073,6 +1184,13 @@ function App() {
       previewPreprocess: showVideoSettings,
     }));
   }, [videoSettings, isStreaming, showVideoSettings]);
+
+  useEffect(() => {
+    showVideoSettingsRef.current = showVideoSettings;
+    if (!showVideoSettings) {
+      lastDisplayFrameAtRef.current = 0;
+    }
+  }, [showVideoSettings]);
 
   useEffect(() => {
     activeTabRef.current = activeTab;
@@ -1298,6 +1416,9 @@ function App() {
                   </div>
                 </div>
                 <div className="stream-frame" ref={streamRef}>
+                  {showVideoSettings && (
+                    <div className="stream-adjusting-indicator">映像調整中</div>
+                  )}
                   <canvas
                     ref={streamCanvasRef}
                     className="stream-canvas"
@@ -1575,6 +1696,18 @@ function App() {
                         onChange={(event) => updateVideoSetting('highlightSuppression', Number(event.target.value))}
                       />
                       <strong className="setting-value">{videoSettings.highlightSuppression.toFixed(2)}</strong>
+                    </label>
+                    <label className="setting-row">
+                      <span>白飛び推定復元</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={videoSettings.highlightRecovery}
+                        onChange={(event) => updateVideoSetting('highlightRecovery', Number(event.target.value))}
+                      />
+                      <strong className="setting-value">{videoSettings.highlightRecovery.toFixed(2)}</strong>
                     </label>
                     <div className="setting-section">
                       <label className="setting-checkbox">
