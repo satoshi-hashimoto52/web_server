@@ -9,7 +9,9 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
+import numpy as np
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -52,8 +54,16 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_SAVE_ROOT = os.path.join(BASE_DIR, "data", "images")
+TEST_MODE_IMAGE_SAVE_ROOT = os.path.join(BASE_DIR, "data", "inbo")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 ALERT_SUPPRESS_MINUTES = 5
+STREAM_TARGET_FPS = 20.0
+STREAM_READ_RETRY_LIMIT = 20
+DEFAULT_DETECTION_CONFIDENCE_THRESHOLD = 0.25
+DEFAULT_RESULT_INTERVAL_FRAMES = 1
+DEFAULT_MERGE_SAME_DIGITS = True
+DEFAULT_MERGE_ROW_TOLERANCE = 0.5
+DEFAULT_MERGE_X_GAP_RATIO = 0.35
 
 
 @app.on_event("startup")
@@ -110,6 +120,17 @@ def _parse_preprocess(raw: Optional[str]) -> Optional[Dict[str, Any]]:
     sharpness = _to_float(payload.get("sharpness", 1.0), "sharpness")
     highlight_suppression = _to_float(payload.get("highlightSuppression", 0.0), "highlightSuppression")
     highlight_recovery = _to_float(payload.get("highlightRecovery", 0.0), "highlightRecovery")
+    highlight_recovery_curve = _to_float(payload.get("highlightRecoveryCurve", 1.0), "highlightRecoveryCurve")
+    highlight_recovery_mode = payload.get("highlightRecoveryMode", "natural")
+    highlight_line_max_dist = _to_int(payload.get("highlightLineMaxDist", 5), "highlightLineMaxDist")
+    highlight_line_kernel_width = _to_int(payload.get("highlightLineKernelWidth", 9), "highlightLineKernelWidth")
+    binarization_payload = payload.get("binarization", {})
+    if binarization_payload is None:
+        binarization_payload = {}
+    if not isinstance(binarization_payload, dict):
+        raise HTTPException(status_code=400, detail="invalid preprocess: binarization")
+    binarization_enabled = bool(binarization_payload.get("enabled", False))
+    binarization_threshold = _to_int(binarization_payload.get("threshold", 128), "binarization.threshold")
 
     if not 0.0 <= brightness <= 3.0:
         raise HTTPException(status_code=400, detail="invalid preprocess: brightness")
@@ -123,6 +144,18 @@ def _parse_preprocess(raw: Optional[str]) -> Optional[Dict[str, Any]]:
         raise HTTPException(status_code=400, detail="invalid preprocess: highlightSuppression")
     if not 0.0 <= highlight_recovery <= 1.0:
         raise HTTPException(status_code=400, detail="invalid preprocess: highlightRecovery")
+    if not 0.5 <= highlight_recovery_curve <= 3.0:
+        raise HTTPException(status_code=400, detail="invalid preprocess: highlightRecoveryCurve")
+    if not isinstance(highlight_recovery_mode, str):
+        raise HTTPException(status_code=400, detail="invalid preprocess: highlightRecoveryMode")
+    if highlight_recovery_mode not in ("natural", "line"):
+        raise HTTPException(status_code=400, detail="invalid preprocess: highlightRecoveryMode")
+    if not 3 <= highlight_line_max_dist <= 20:
+        raise HTTPException(status_code=400, detail="invalid preprocess: highlightLineMaxDist")
+    if not 3 <= highlight_line_kernel_width <= 25:
+        raise HTTPException(status_code=400, detail="invalid preprocess: highlightLineKernelWidth")
+    if not 0 <= binarization_threshold <= 255:
+        raise HTTPException(status_code=400, detail="invalid preprocess: binarization.threshold")
 
     clahe_payload = payload.get("clahe", {})
     if clahe_payload is None:
@@ -159,6 +192,14 @@ def _parse_preprocess(raw: Optional[str]) -> Optional[Dict[str, Any]]:
         "sharpness": _clamp(sharpness, 0.0, 3.0),
         "highlightSuppression": _clamp(highlight_suppression, 0.0, 1.0),
         "highlightRecovery": _clamp(highlight_recovery, 0.0, 1.0),
+        "highlightRecoveryCurve": _clamp(highlight_recovery_curve, 0.5, 3.0),
+        "highlightRecoveryMode": highlight_recovery_mode,
+        "highlightLineMaxDist": int(_clamp(float(highlight_line_max_dist), 3.0, 20.0)),
+        "highlightLineKernelWidth": int(_clamp(float(highlight_line_kernel_width), 3.0, 25.0)),
+        "binarization": {
+            "enabled": binarization_enabled,
+            "threshold": int(_clamp(float(binarization_threshold), 0.0, 255.0)),
+        },
         "clahe": {
             "enabled": clahe_enabled,
             "clipLimit": _clamp(clahe_clip_limit, 1.0, 12.0),
@@ -182,6 +223,152 @@ def _parse_preprocess_ws_payload(raw_payload: Any) -> Optional[Dict[str, Any]]:
     raise HTTPException(status_code=400, detail="invalid preprocess json")
 
 
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _default_detection_settings() -> Dict[str, Any]:
+    return {
+        "confidence_threshold": DEFAULT_DETECTION_CONFIDENCE_THRESHOLD,
+        "result_interval_frames": DEFAULT_RESULT_INTERVAL_FRAMES,
+        "merge_same_digits": DEFAULT_MERGE_SAME_DIGITS,
+        "merge_row_tolerance": DEFAULT_MERGE_ROW_TOLERANCE,
+        "merge_x_gap_ratio": DEFAULT_MERGE_X_GAP_RATIO,
+    }
+
+
+def _sanitize_detection_settings(payload: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    base = fallback.copy() if isinstance(fallback, dict) else _default_detection_settings()
+
+    confidence_threshold = _to_float(
+        payload.get("confidenceThreshold", payload.get("confidence_threshold", base["confidence_threshold"])),
+        "detectionSettings.confidenceThreshold",
+    )
+    result_interval_frames = _to_int(
+        payload.get("resultIntervalFrames", payload.get("result_interval_frames", base["result_interval_frames"])),
+        "detectionSettings.resultIntervalFrames",
+    )
+    merge_same_digits = _to_bool(payload.get("mergeSameDigits", payload.get("merge_same_digits", base["merge_same_digits"])), base["merge_same_digits"])
+    merge_row_tolerance = _to_float(
+        payload.get("mergeSameDigitsRowTolerance", payload.get("merge_row_tolerance", base["merge_row_tolerance"])),
+        "detectionSettings.mergeSameDigitsRowTolerance",
+    )
+    merge_x_gap_ratio = _to_float(
+        payload.get("mergeSameDigitsXGapRatio", payload.get("merge_x_gap_ratio", base["merge_x_gap_ratio"])),
+        "detectionSettings.mergeSameDigitsXGapRatio",
+    )
+
+    if not 0.01 <= confidence_threshold <= 0.99:
+        raise HTTPException(status_code=400, detail="invalid detectionSettings: confidenceThreshold")
+    if not 1 <= result_interval_frames <= 60:
+        raise HTTPException(status_code=400, detail="invalid detectionSettings: resultIntervalFrames")
+    if not 0.05 <= merge_row_tolerance <= 2.0:
+        raise HTTPException(status_code=400, detail="invalid detectionSettings: mergeSameDigitsRowTolerance")
+    if not 0.01 <= merge_x_gap_ratio <= 2.0:
+        raise HTTPException(status_code=400, detail="invalid detectionSettings: mergeSameDigitsXGapRatio")
+
+    return {
+        "confidence_threshold": _clamp(confidence_threshold, 0.01, 0.99),
+        "result_interval_frames": int(_clamp(float(result_interval_frames), 1.0, 60.0)),
+        "merge_same_digits": merge_same_digits,
+        "merge_row_tolerance": _clamp(merge_row_tolerance, 0.05, 2.0),
+        "merge_x_gap_ratio": _clamp(merge_x_gap_ratio, 0.01, 2.0),
+    }
+
+
+def _parse_detection_settings_ws_payload(raw_payload: Any, fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if raw_payload is None:
+        return fallback.copy() if isinstance(fallback, dict) else _default_detection_settings()
+    if isinstance(raw_payload, str):
+        text = raw_payload.strip()
+        if not text:
+            return fallback.copy() if isinstance(fallback, dict) else _default_detection_settings()
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="invalid detectionSettings json")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid detectionSettings json")
+        return _sanitize_detection_settings(payload, fallback=fallback)
+    if isinstance(raw_payload, dict):
+        return _sanitize_detection_settings(raw_payload, fallback=fallback)
+    raise HTTPException(status_code=400, detail="invalid detectionSettings json")
+
+
+def _resolve_test_mode_save_dir(save_dir: Optional[str], save_dir_abs: Optional[str]) -> str:
+    absolute_raw = (save_dir_abs or "").strip()
+    if absolute_raw:
+        expanded = os.path.expanduser(absolute_raw)
+        if not os.path.isabs(expanded):
+            raise HTTPException(status_code=400, detail="invalid save_dir_abs")
+        return os.path.abspath(expanded)
+
+    raw = (save_dir or "").strip()
+    if not raw:
+        return TEST_MODE_IMAGE_SAVE_ROOT
+
+    normalized = raw.replace("\\", "/")
+    normalized = normalized.lstrip("/")
+    normalized = os.path.normpath(normalized)
+    if normalized in {"", "."}:
+        return TEST_MODE_IMAGE_SAVE_ROOT
+    if normalized.startswith("..") or os.path.isabs(normalized):
+        raise HTTPException(status_code=400, detail="invalid save_dir")
+
+    base_dir = os.path.abspath(TEST_MODE_IMAGE_SAVE_ROOT)
+    target_dir = os.path.abspath(os.path.join(base_dir, normalized))
+    try:
+        if os.path.commonpath([base_dir, target_dir]) != base_dir:
+            raise HTTPException(status_code=400, detail="invalid save_dir")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid save_dir")
+    return target_dir
+
+
+@app.post("/api/v1/test-mode/select-save-dir")
+def api_select_test_mode_save_dir():
+    script = 'POSIX path of (choose folder with prompt "テストモード画像の保存先を選択")'
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception:
+        logger.exception("failed to open folder picker")
+        raise HTTPException(status_code=500, detail="failed to open folder picker")
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        if "User canceled" in stderr:
+            raise HTTPException(status_code=400, detail="folder selection canceled")
+        logger.error("folder picker failed: return=%s stderr=%s", result.returncode, stderr)
+        raise HTTPException(status_code=500, detail="failed to select save dir")
+    if not stdout:
+        raise HTTPException(status_code=500, detail="failed to select save dir")
+
+    selected_dir = os.path.abspath(os.path.expanduser(stdout))
+    return {
+        "ok": True,
+        "selected_dir": selected_dir,
+        "default_dir": TEST_MODE_IMAGE_SAVE_ROOT,
+    }
+
+
 def _draw_detections_overlay(frame, detections, model_name: str):
     for det in detections or []:
         x1 = int(det.get("x1", 0))
@@ -202,17 +389,21 @@ def _draw_detections_overlay(frame, detections, model_name: str):
         )
 
 
-def _draw_stream_metrics_overlay(frame, model_name: str, fps: float):
+def _draw_stream_metrics_overlay(
+    frame,
+    model_name: str,
+    processing_fps: float,
+    camera_raw_fps: float,
+    show_processing_fps: bool,
+):
     model_label = f"Model: {model_name}"
     model_text_org = (12, 34)
-    fps_label = f"FPS: {fps:.1f}" if fps > 0 else "FPS: -"
-    fps_text_org = (12, max(24, frame.shape[0] - 14))
+    target_fps = processing_fps if show_processing_fps else camera_raw_fps
+    _ = target_fps
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.9
     cv2.putText(frame, model_label, model_text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
     cv2.putText(frame, model_label, model_text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(frame, fps_label, fps_text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
-    cv2.putText(frame, fps_label, fps_text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
 
 
 class MeterUpsertRequest(BaseModel):
@@ -321,6 +512,7 @@ async def upload_image(
     model_type: str = Form("dummy"),
     model_name: str = Form(""),
     preprocess: Optional[str] = Form(None),
+    detection_settings: Optional[str] = Form(None),
 ):
     if image is None:
         raise HTTPException(status_code=400, detail="image is required")
@@ -353,6 +545,7 @@ async def upload_image(
     if normalized_model_type not in {"dummy", "yolo"}:
         raise HTTPException(status_code=400, detail="model_type must be dummy or yolo")
     preprocess_config = _parse_preprocess(preprocess)
+    detection_settings_config = _parse_detection_settings_ws_payload(detection_settings)
 
     try:
         result = infer(
@@ -361,6 +554,7 @@ async def upload_image(
             model_type=normalized_model_type,
             model_name=model_name.strip() or None,
             preprocess=preprocess_config if normalized_model_type == "yolo" else None,
+            detection_settings=detection_settings_config if normalized_model_type == "yolo" else None,
         )
         logger.info("inference completed: meter_id=%s model_type=%s", result["meter_id"], result["model_type"])
     except Exception:
@@ -392,6 +586,54 @@ async def upload_image(
         "ok": True,
         "reading": reading,
         "alert_sent": alert_sent,
+    }
+
+
+@app.post("/api/v1/test-mode/capture")
+async def save_test_mode_capture(
+    image: Optional[UploadFile] = File(None),
+    save_dir: str = Form(""),
+    save_dir_abs: str = Form(""),
+):
+    if image is None:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    content = await image.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="empty image")
+
+    if image.content_type and not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="invalid content type")
+
+    decoded = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if decoded is None:
+        raise HTTPException(status_code=400, detail="invalid image data")
+
+    target_dir = _resolve_test_mode_save_dir(save_dir, save_dir_abs)
+    os.makedirs(target_dir, exist_ok=True)
+    filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+    abs_path = os.path.join(target_dir, filename)
+    if os.path.exists(abs_path):
+        raise HTTPException(status_code=409, detail="same timestamp file already exists, please retry")
+
+    try:
+        ok = cv2.imwrite(abs_path, decoded)
+        if not ok:
+            raise RuntimeError("cv2.imwrite failed")
+        logger.info("test mode image saved: %s", abs_path)
+    except Exception:
+        logger.exception("failed to save test mode image")
+        raise HTTPException(status_code=500, detail="failed to save test mode image")
+
+    rel_path = os.path.relpath(abs_path, BASE_DIR)
+    if rel_path.startswith(".."):
+        rel_path = abs_path
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "path": rel_path,
+        "abs_path": abs_path,
     }
 
 
@@ -512,13 +754,19 @@ async def websocket_stream(websocket: WebSocket):
     regions = []
     model_name = MODEL_FILENAME
     preprocess_config = None
+    detection_settings = _default_detection_settings()
     preview_preprocess = False
+    show_inference_overlay = True
     camera_name = "default"
     region_log_state = {}
     should_stop = False
     stop_reason = ""
     previous_frame_time = None
     fps_ema = 0.0
+    camera_raw_fps = 0.0
+    frame_seq = 0
+    latest_detections = []
+    latest_results_payload = []
 
     async def send_status(state: str, message: str = ""):
         payload = {"type": "status", "state": state}
@@ -538,6 +786,10 @@ async def websocket_stream(websocket: WebSocket):
             else:
                 local_cap = cv2.VideoCapture(source)
             if local_cap is not None and local_cap.isOpened():
+                try:
+                    local_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
                 return local_cap, ""
             if local_cap is not None:
                 local_cap.release()
@@ -561,7 +813,13 @@ async def websocket_stream(websocket: WebSocket):
                         model_name = resolved
                 if "preprocess" in payload:
                     preprocess_config = _parse_preprocess_ws_payload(payload.get("preprocess"))
+                if "detectionSettings" in payload:
+                    detection_settings = _parse_detection_settings_ws_payload(
+                        payload.get("detectionSettings"),
+                        fallback=detection_settings,
+                    )
                 preview_preprocess = bool(payload.get("previewPreprocess", False))
+                show_inference_overlay = bool(payload.get("showInferenceOverlay", True))
         except json.JSONDecodeError:
             pass
 
@@ -586,14 +844,29 @@ async def websocket_stream(websocket: WebSocket):
             await websocket.send_text(f"ERROR: {message}")
             await websocket.close()
             return
+        try:
+            camera_raw_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        except Exception:
+            camera_raw_fps = 0.0
+        read_failures = 0
+        if camera_raw_fps < 1 or camera_raw_fps > 240:
+            camera_raw_fps = 0.0
 
         await send_status("streaming")
 
         # フレームを読み続けて送信
+        target_frame_interval = 1.0 / max(STREAM_TARGET_FPS, 1.0)
         while not should_stop:
+            loop_started_at = time.time()
             success, frame = cap.read()
             if not success:
-                break
+                read_failures += 1
+                if read_failures >= STREAM_READ_RETRY_LIMIT:
+                    stop_reason = "frame read failed"
+                    break
+                await asyncio.sleep(0.01)
+                continue
+            read_failures = 0
 
             frame_now = time.time()
             if previous_frame_time is not None:
@@ -615,19 +888,30 @@ async def websocket_stream(websocket: WebSocket):
                         update_type = update_payload.get("type")
                         if update_type == "regions":
                             regions = update_payload.get("regions", []) or []
-                            await send_status("streaming", "regions updated")
                         elif update_type == "model":
                             resolved = resolve_model_name(update_payload.get("model"))
                             if resolved:
                                 model_name = resolved
-                                await send_status("streaming", "model updated")
                         elif update_type == "preprocess":
                             try:
                                 preprocess_config = _parse_preprocess_ws_payload(update_payload.get("preprocess"))
                                 preview_preprocess = bool(update_payload.get("previewPreprocess", preview_preprocess))
-                                await send_status("streaming", "preprocess updated")
+                                show_inference_overlay = bool(update_payload.get("showInferenceOverlay", show_inference_overlay))
+                                if "detectionSettings" in update_payload:
+                                    detection_settings = _parse_detection_settings_ws_payload(
+                                        update_payload.get("detectionSettings"),
+                                        fallback=detection_settings,
+                                    )
                             except HTTPException as preprocess_error:
                                 await send_status("error", str(preprocess_error.detail))
+                        elif update_type == "detection_settings":
+                            try:
+                                detection_settings = _parse_detection_settings_ws_payload(
+                                    update_payload.get("detectionSettings"),
+                                    fallback=detection_settings,
+                                )
+                            except HTTPException as detection_error:
+                                await send_status("error", str(detection_error.detail))
                         elif update_type == "stop":
                             should_stop = True
                             stop_reason = "stop requested"
@@ -638,89 +922,145 @@ async def websocket_stream(websocket: WebSocket):
                 pass
 
             # 物体検出（推論入力は preprocess 適用可）
-            frame_for_infer = frame
+            frame_seq += 1
+            confidence_threshold = float(detection_settings.get("confidence_threshold", DEFAULT_DETECTION_CONFIDENCE_THRESHOLD))
+            result_interval_frames = int(detection_settings.get("result_interval_frames", DEFAULT_RESULT_INTERVAL_FRAMES))
+            merge_same_digits = bool(detection_settings.get("merge_same_digits", DEFAULT_MERGE_SAME_DIGITS))
+            merge_row_tolerance = float(detection_settings.get("merge_row_tolerance", DEFAULT_MERGE_ROW_TOLERANCE))
+            merge_x_gap_ratio = float(detection_settings.get("merge_x_gap_ratio", DEFAULT_MERGE_X_GAP_RATIO))
+            should_run_inference = (frame_seq % max(result_interval_frames, 1) == 0) or not latest_detections
+
+            frame_for_infer = frame.copy()
             if preprocess_config:
                 try:
-                    frame_for_infer = apply_preprocess(frame.copy(), preprocess_config)
+                    frame_for_infer = apply_preprocess(frame_for_infer, preprocess_config)
                 except Exception as preprocess_error:
                     await send_status("error", f"preprocess failed: {preprocess_error}")
-                    frame_for_infer = frame
-            infer_display_frame, detections = detect_objects(frame_for_infer, model_name)
-            if preview_preprocess:
-                display_frame = infer_display_frame
+                    frame_for_infer = frame.copy()
+
+            if should_run_inference:
+                infer_display_frame, detections = detect_objects(
+                    frame_for_infer,
+                    model_name,
+                    draw_overlay=show_inference_overlay,
+                    draw_model_label=show_inference_overlay,
+                    conf_threshold=confidence_threshold,
+                )
+                latest_detections = detections
             else:
-                display_frame = frame
-                _draw_detections_overlay(display_frame, detections, model_name)
-            _draw_stream_metrics_overlay(display_frame, model_name, fps_ema)
+                detections = latest_detections
+                infer_display_frame = frame_for_infer
 
-            # 領域ごとの検出結果（左から結合）
-            height, width = display_frame.shape[:2]
-            results_payload = []
-            for region in regions:
-                try:
-                    x = max(min(float(region.get("x", 0)), 100.0), 0.0)
-                    y = max(min(float(region.get("y", 0)), 100.0), 0.0)
-                    w = max(min(float(region.get("w", 0)), 100.0), 0.0)
-                    h = max(min(float(region.get("h", 0)), 100.0), 0.0)
-                except (TypeError, ValueError):
-                    continue
-                rx1 = int((x / 100.0) * width)
-                ry1 = int((y / 100.0) * height)
-                rx2 = int(((x + w) / 100.0) * width)
-                ry2 = int(((y + h) / 100.0) * height)
-                region_detections = []
-                for det in detections:
-                    cx = (det["x1"] + det["x2"]) / 2
-                    cy = (det["y1"] + det["y2"]) / 2
-                    if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                        region_detections.append(det)
-                value, debug_info = build_meter_value(region_detections)
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "region postprocess id=%s raw=%s dedup=%s",
-                        region.get("id"),
-                        debug_info.get("raw_labels"),
-                        debug_info.get("dedup_labels"),
-                    )
-                results_payload.append({
-                    "id": region.get("id"),
-                    "name": region.get("name"),
-                    "value": value,
-                })
+            if preview_preprocess:
+                display_frame = infer_display_frame.copy()
+                if show_inference_overlay and not should_run_inference:
+                    _draw_detections_overlay(display_frame, detections, model_name)
+            else:
+                display_frame = frame.copy()
+                if show_inference_overlay:
+                    _draw_detections_overlay(display_frame, detections, model_name)
+            _draw_stream_metrics_overlay(
+                display_frame,
+                model_name,
+                fps_ema,
+                camera_raw_fps,
+                preview_preprocess,
+            )
 
-                region_id = str(region.get("id") or "")
-                region_name = str(region.get("name") or "")
-                if region_id and value:
-                    now_ts = time.time()
-                    last_state = region_log_state.get(region_id)
-                    should_log = False
-                    if not last_state:
-                        should_log = True
+            results_payload = latest_results_payload
+            if should_run_inference:
+                # 領域ごとの検出結果（左から結合）
+                height, width = display_frame.shape[:2]
+                results_payload = []
+                for region in regions:
+                    try:
+                        raw_x = float(region.get("x", 0))
+                        raw_y = float(region.get("y", 0))
+                        raw_w = float(region.get("w", 0))
+                        raw_h = float(region.get("h", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if raw_x <= 100.0 and raw_y <= 100.0 and raw_w <= 100.0 and raw_h <= 100.0:
+                        x = max(min(raw_x, 100.0), 0.0)
+                        y = max(min(raw_y, 100.0), 0.0)
+                        w = max(min(raw_w, 100.0), 0.0)
+                        h = max(min(raw_h, 100.0), 0.0)
+                        rx1 = int((x / 100.0) * width)
+                        ry1 = int((y / 100.0) * height)
+                        rx2 = int(((x + w) / 100.0) * width)
+                        ry2 = int(((y + h) / 100.0) * height)
                     else:
-                        value_changed = last_state.get("value") != value
-                        elapsed = now_ts - float(last_state.get("ts", 0.0))
-                        should_log = value_changed or elapsed >= 1.0
-                    if should_log:
-                        try:
-                            insert_stream_reading(
-                                camera_name=camera_name,
-                                region_id=region_id,
-                                region_name=region_name,
-                                value_text=value,
-                            )
-                            region_log_state[region_id] = {"value": value, "ts": now_ts}
-                        except Exception:
-                            logger.exception("failed to save stream reading")
+                        x = max(min(raw_x, float(width)), 0.0)
+                        y = max(min(raw_y, float(height)), 0.0)
+                        w = max(min(raw_w, float(width)), 0.0)
+                        h = max(min(raw_h, float(height)), 0.0)
+                        rx1 = int(x)
+                        ry1 = int(y)
+                        rx2 = int(min(x + w, float(width)))
+                        ry2 = int(min(y + h, float(height)))
+                    region_detections = []
+                    for det in detections:
+                        cx = (det["x1"] + det["x2"]) / 2
+                        cy = (det["y1"] + det["y2"]) / 2
+                        if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
+                            region_detections.append(det)
+                    value, debug_info = build_meter_value(
+                        region_detections,
+                        min_confidence=confidence_threshold,
+                        merge_same_digits=merge_same_digits,
+                        row_tolerance_ratio=merge_row_tolerance,
+                        x_gap_ratio=merge_x_gap_ratio,
+                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "region postprocess id=%s raw=%s dedup=%s",
+                            region.get("id"),
+                            debug_info.get("raw_labels"),
+                            debug_info.get("dedup_labels"),
+                        )
+                    results_payload.append({
+                        "id": region.get("id"),
+                        "name": region.get("name"),
+                        "value": value,
+                    })
+
+                    region_id = str(region.get("id") or "")
+                    region_name = str(region.get("name") or "")
+                    if region_id and value:
+                        now_ts = time.time()
+                        last_state = region_log_state.get(region_id)
+                        should_log = False
+                        if not last_state:
+                            should_log = True
+                        else:
+                            value_changed = last_state.get("value") != value
+                            elapsed = now_ts - float(last_state.get("ts", 0.0))
+                            should_log = value_changed or elapsed >= 1.0
+                        if should_log:
+                            try:
+                                insert_stream_reading(
+                                    camera_name=camera_name,
+                                    region_id=region_id,
+                                    region_name=region_name,
+                                    value_text=value,
+                                )
+                                region_log_state[region_id] = {"value": value, "ts": now_ts}
+                            except Exception:
+                                logger.exception("failed to save stream reading")
+                latest_results_payload = results_payload
 
             # JPEG エンコード → Base64
-            _, buffer = cv2.imencode('.jpg', display_frame)
+            _, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             jpg_b64 = base64.b64encode(buffer).decode('utf-8')
 
             await websocket.send_text(json.dumps({
                 "image": jpg_b64,
                 "results": results_payload,
             }))
-            await asyncio.sleep(0.03)  # ~30fps
+            elapsed = time.time() - loop_started_at
+            wait = target_frame_interval - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
 
         if cap:
             cap.release()

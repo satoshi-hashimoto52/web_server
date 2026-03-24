@@ -13,6 +13,9 @@ def _to_float(value, default=0.0) -> float:
 def build_meter_value(
     detections: List[Dict[str, object]],
     min_confidence: float = 0.25,
+    merge_same_digits: bool = True,
+    row_tolerance_ratio: float = 0.5,
+    x_gap_ratio: float = 0.35,
 ) -> Tuple[str, Dict[str, object]]:
     """
     重複しやすい同一桁検出を cx/cy の近接で抑制し、左→右で値文字列を生成する。
@@ -48,6 +51,9 @@ def build_meter_value(
             }
         )
 
+    row_tolerance_ratio = max(0.05, min(_to_float(row_tolerance_ratio, 0.5), 2.0))
+    x_gap_ratio = max(0.01, min(_to_float(x_gap_ratio, 0.35), 2.0))
+
     normalized.sort(key=lambda item: item["cx"])
     accepted: List[Dict[str, object]] = []
     for cur in normalized:
@@ -57,9 +63,9 @@ def build_meter_value(
 
         prev = accepted[-1]
         same_label = cur["label"] == prev["label"]
-        same_row = abs(cur["cy"] - prev["cy"]) <= 0.5 * min(prev["h"], cur["h"])
-        near = abs(cur["cx"] - prev["cx"]) <= 0.35 * min(prev["w"], cur["w"])
-        if same_label and same_row and near:
+        same_row = abs(cur["cy"] - prev["cy"]) <= row_tolerance_ratio * min(prev["h"], cur["h"])
+        near = abs(cur["cx"] - prev["cx"]) <= x_gap_ratio * min(prev["w"], cur["w"])
+        if merge_same_digits and same_label and same_row and near:
             if cur["conf"] > prev["conf"]:
                 accepted[-1] = cur
             continue
@@ -73,4 +79,3 @@ def build_meter_value(
         "dedup_count": len(accepted),
     }
     return value, debug_info
-

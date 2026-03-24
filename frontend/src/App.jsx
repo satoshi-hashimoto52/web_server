@@ -2,7 +2,7 @@
 // frontend/src/main.jsx
 // *********************************************************
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './styles.css';
 import DashboardPage from './DashboardPage';
 
@@ -10,6 +10,11 @@ const REGION_STORAGE_KEY = 'web_server_regions_v1';
 const VIDEO_SETTINGS_STORAGE_KEY = 'stream.video.settings';
 const CAMERA_PROFILES_KEY = 'stream.camera.profiles.v1';
 const ACTIVE_CAMERA_PROFILE_KEY = 'stream.camera.active_profile_id.v1';
+const LAST_USED_CAMERA_SETTINGS_KEY = 'stream.camera.last_used_settings.v1';
+const CAMERA_SIDEBAR_COLLAPSED_KEY = 'stream.camera.sidebar.collapsed.v1';
+const TEST_CAPTURE_SAVE_DIR_KEY = 'stream.test.capture.save_dir.v1';
+const TEST_CAPTURE_SAVE_DIR_ABS_KEY = 'stream.test.capture.save_dir_abs.v1';
+const SETTINGS_DIALOG_DEFAULT_WIDTH = 460;
 const INFERENCE_RETRY_COUNT = 3;
 const INFERENCE_RETRY_INTERVAL_MS = 150;
 const START_TIMEOUT_MS = 8000;
@@ -17,7 +22,12 @@ const FIRST_FRAME_TIMEOUT_MS = 8000;
 const FRAME_STALL_TIMEOUT_MS = 5000;
 const AUTO_RECONNECT_MAX = 2;
 const ADJUSTING_PREVIEW_FPS = 8;
-const ADJUSTING_PREVIEW_INTERVAL_MS = 1000 / ADJUSTING_PREVIEW_FPS;
+const NORMAL_PREVIEW_FPS = 20;
+const NORMAL_PREVIEW_MAX_WIDTH = 960;
+const HEAVY_PREVIEW_MAX_WIDTH = 720;
+const REGION_VALUES_UPDATE_FPS = 12;
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5050';
+const WS_BASE_URL = API_BASE_URL.replace(/^http/i, 'ws').replace(/\/$/, '');
 const DEFAULT_VIDEO_SETTINGS = Object.freeze({
   brightness: 1,
   contrast: 1,
@@ -25,12 +35,25 @@ const DEFAULT_VIDEO_SETTINGS = Object.freeze({
   sharpness: 1,
   highlightSuppression: 0,
   highlightRecovery: 0,
+  highlightRecoveryCurve: 1,
+  highlightRecoveryMode: 'natural',
+  highlightLineMaxDist: 5,
+  highlightLineKernelWidth: 9,
+  binarizationEnabled: false,
+  binarizationThreshold: 128,
   claheEnabled: false,
   claheClipLimit: 2,
   claheTileGridSize: 8,
   zoom: 1,
   centerX: 0.5,
   centerY: 0.5,
+});
+const DEFAULT_DETECTION_SETTINGS = Object.freeze({
+  confidenceThreshold: 0.25,
+  resultIntervalFrames: 1,
+  mergeSameDigits: true,
+  mergeSameDigitsRowTolerance: 0.5,
+  mergeSameDigitsXGapRatio: 0.35,
 });
 
 const clampNumber = (value, min, max) => Math.min(Math.max(value, min), max);
@@ -41,6 +64,14 @@ const toPreprocessPayload = (settings) => ({
   sharpness: settings.sharpness,
   highlightSuppression: settings.highlightSuppression,
   highlightRecovery: settings.highlightRecovery,
+  highlightRecoveryCurve: settings.highlightRecoveryCurve,
+  highlightRecoveryMode: settings.highlightRecoveryMode,
+  highlightLineMaxDist: settings.highlightLineMaxDist,
+  highlightLineKernelWidth: settings.highlightLineKernelWidth,
+  binarization: {
+    enabled: settings.binarizationEnabled,
+    threshold: settings.binarizationThreshold,
+  },
   clahe: {
     enabled: settings.claheEnabled,
     clipLimit: settings.claheClipLimit,
@@ -66,12 +97,70 @@ const sanitizeVideoSettings = (value) => {
     sharpness: clampNumber(asNumber(input.sharpness, 1), 0, 3),
     highlightSuppression: clampNumber(asNumber(input.highlightSuppression, 0), 0, 1),
     highlightRecovery: clampNumber(asNumber(input.highlightRecovery, 0), 0, 1),
+    highlightRecoveryCurve: clampNumber(asNumber(input.highlightRecoveryCurve, 1), 0.5, 3),
+    highlightRecoveryMode: input.highlightRecoveryMode === 'line' ? 'line' : 'natural',
+    highlightLineMaxDist: clampNumber(Math.round(asNumber(input.highlightLineMaxDist, 5)), 3, 20),
+    highlightLineKernelWidth: clampNumber(Math.round(asNumber(input.highlightLineKernelWidth, 9)), 3, 25),
+    binarizationEnabled: Boolean(input.binarizationEnabled),
+    binarizationThreshold: clampNumber(Math.round(asNumber(input.binarizationThreshold, 128)), 0, 255),
     claheEnabled: Boolean(input.claheEnabled),
     claheClipLimit: clampNumber(asNumber(input.claheClipLimit, 2), 1, 12),
     claheTileGridSize: clampNumber(Math.round(asNumber(input.claheTileGridSize, 8)), 4, 24),
     zoom: clampNumber(asNumber(input.zoom, 1), 1, 6),
     centerX: clampNumber(asNumber(input.centerX, 0.5), 0, 1),
     centerY: clampNumber(asNumber(input.centerY, 0.5), 0, 1),
+  };
+};
+
+const sanitizeDetectionSettings = (value) => {
+  const input = value && typeof value === 'object' ? value : {};
+  const asNumber = (raw, fallback) => {
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : fallback;
+  };
+  return {
+    confidenceThreshold: clampNumber(
+      asNumber(input.confidenceThreshold ?? input.confidence_threshold, DEFAULT_DETECTION_SETTINGS.confidenceThreshold),
+      0.01,
+      0.99,
+    ),
+    resultIntervalFrames: clampNumber(
+      Math.round(asNumber(input.resultIntervalFrames ?? input.result_interval_frames, DEFAULT_DETECTION_SETTINGS.resultIntervalFrames)),
+      1,
+      60,
+    ),
+    mergeSameDigits: Boolean(input.mergeSameDigits ?? input.merge_same_digits ?? DEFAULT_DETECTION_SETTINGS.mergeSameDigits),
+    mergeSameDigitsRowTolerance: clampNumber(
+      asNumber(input.mergeSameDigitsRowTolerance ?? input.merge_row_tolerance, DEFAULT_DETECTION_SETTINGS.mergeSameDigitsRowTolerance),
+      0.05,
+      2.0,
+    ),
+    mergeSameDigitsXGapRatio: clampNumber(
+      asNumber(input.mergeSameDigitsXGapRatio ?? input.merge_x_gap_ratio, DEFAULT_DETECTION_SETTINGS.mergeSameDigitsXGapRatio),
+      0.01,
+      2.0,
+    ),
+  };
+};
+
+const toDetectionSettingsPayload = (settings) => ({
+  confidenceThreshold: settings.confidenceThreshold,
+  resultIntervalFrames: settings.resultIntervalFrames,
+  mergeSameDigits: settings.mergeSameDigits,
+  mergeSameDigitsRowTolerance: settings.mergeSameDigitsRowTolerance,
+  mergeSameDigitsXGapRatio: settings.mergeSameDigitsXGapRatio,
+});
+
+const sanitizeLastUsedCameraSettings = (value) => {
+  if (!value || typeof value !== 'object') return null;
+  return {
+    activeCameraProfileId: typeof value.activeCameraProfileId === 'string' ? value.activeCameraProfileId : '',
+    sourceType: value.sourceType === 'device' ? 'device' : 'url',
+    streamUrl: typeof value.streamUrl === 'string' ? value.streamUrl : '',
+    deviceIndex: typeof value.deviceIndex === 'string' ? value.deviceIndex : '0',
+    model: typeof value.model === 'string' ? value.model : '',
+    videoSettings: sanitizeVideoSettings(value.videoSettings),
+    detectionSettings: sanitizeDetectionSettings(value.detectionSettings),
   };
 };
 
@@ -84,6 +173,7 @@ const sanitizeCameraProfile = (profile, fallbackName = 'default') => ({
   model: typeof profile?.model === 'string' ? profile.model : '',
   regions: Array.isArray(profile?.regions) ? profile.regions : [],
   videoSettings: sanitizeVideoSettings(profile?.videoSettings),
+  detectionSettings: sanitizeDetectionSettings(profile?.detectionSettings),
 });
 
 const applyBasicAdjustments = (data, brightness, contrast, gamma) => {
@@ -149,9 +239,12 @@ const applyHighlightSuppression = (data, strength) => {
   }
 };
 
-const applyHighlightRecovery = (data, width, height, strength) => {
+const applyHighlightRecovery = (data, width, height, strength, curve = 1) => {
   if (strength <= 0) return;
   if (width < 3 || height < 3) return;
+  const normalizedStrength = clampNumber(strength, 0, 1);
+  const curveStrength = clampNumber(curve, 0.5, 3);
+  const effectiveStrength = 1 - Math.pow(1 - normalizedStrength, curveStrength);
   const src = new Uint8ClampedArray(data);
   const rowStride = width * 4;
   const brightThreshold = 210;
@@ -201,7 +294,7 @@ const applyHighlightRecovery = (data, width, height, strength) => {
       const avgG = sumG / weightSum;
       const avgB = sumB / weightSum;
       const over = clampNumber((maxCh - brightThreshold) / (255 - brightThreshold), 0, 1);
-      const mix = strength * (0.45 + over * 0.55);
+      const mix = effectiveStrength * (0.45 + over * 0.55);
 
       const restoredR = r * (1 - mix) + avgR * mix;
       const restoredG = g * (1 - mix) + avgG * mix;
@@ -215,6 +308,17 @@ const applyHighlightRecovery = (data, width, height, strength) => {
       data[idx + 1] = clampNumber(restoredG * lumaScale, 0, 255);
       data[idx + 2] = clampNumber(restoredB * lumaScale, 0, 255);
     }
+  }
+};
+
+const applyBinarization = (data, threshold) => {
+  const t = clampNumber(Math.round(threshold), 0, 255);
+  for (let i = 0; i < data.length; i += 4) {
+    const luma = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    const v = luma >= t ? 255 : 0;
+    data[i] = v;
+    data[i + 1] = v;
+    data[i + 2] = v;
   }
 };
 
@@ -300,7 +404,6 @@ function App() {
   const [selectedModel, setSelectedModel] = useState('');
   const [cameraProfiles, setCameraProfiles] = useState([]);
   const [activeCameraProfileId, setActiveCameraProfileId] = useState('');
-  const [showCameraSettingsDetails, setShowCameraSettingsDetails] = useState(false);
   const [imageData, setImageData] = useState('');
   const [regions, setRegions] = useState([]);
   const [regionValues, setRegionValues] = useState({});
@@ -308,12 +411,46 @@ function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [connectionState, setConnectionState] = useState('idle');
   const [connectionMessage, setConnectionMessage] = useState('');
+  const [isCameraSidebarCollapsed, setIsCameraSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(CAMERA_SIDEBAR_COLLAPSED_KEY) === '1';
+    } catch (_error) {
+      return false;
+    }
+  });
   const [dragOverId, setDragOverId] = useState(null);
   const [videoSettings, setVideoSettings] = useState(DEFAULT_VIDEO_SETTINGS);
   const [showVideoSettings, setShowVideoSettings] = useState(false);
+  const [detectionSettings, setDetectionSettings] = useState(DEFAULT_DETECTION_SETTINGS);
+  const [hideRoiRegions, setHideRoiRegions] = useState(false);
+  const [hideInferenceResults, setHideInferenceResults] = useState(false);
+  const [showCameraSettings, setShowCameraSettings] = useState(false);
+  const [showSettingsDialog, setShowSettingsDialog] = useState(false);
+  const [activeSettingsTab, setActiveSettingsTab] = useState('yolo');
+  const [settingsDialogPosition, setSettingsDialogPosition] = useState({ left: 24, top: 64 });
+  const [isSettingsDialogDragging, setIsSettingsDialogDragging] = useState(false);
   const [inferLoading, setInferLoading] = useState(false);
   const [inferError, setInferError] = useState('');
   const [inferResult, setInferResult] = useState(null);
+  const [testCaptureSaveDir, setTestCaptureSaveDir] = useState(() => {
+    try {
+      return window.localStorage.getItem(TEST_CAPTURE_SAVE_DIR_KEY) || '';
+    } catch (_error) {
+      return '';
+    }
+  });
+  const [testCaptureSaveDirAbs, setTestCaptureSaveDirAbs] = useState(() => {
+    try {
+      return window.localStorage.getItem(TEST_CAPTURE_SAVE_DIR_ABS_KEY) || '';
+    } catch (_error) {
+      return '';
+    }
+  });
+  const [testCaptureSelectingDir, setTestCaptureSelectingDir] = useState(false);
+  const [testCaptureSaving, setTestCaptureSaving] = useState(false);
+  const [testCaptureMessage, setTestCaptureMessage] = useState('');
+  const [displayFps, setDisplayFps] = useState(0);
+  const [sourceSize, setSourceSize] = useState({ width: 0, height: 0 });
   const ws = useRef(null);
   const connectionStateRef = useRef('idle');
   const activeTabRef = useRef('stream');
@@ -321,7 +458,10 @@ function App() {
   const streamRef = useRef(null);
   const streamCanvasRef = useRef(null);
   const sourceImageRef = useRef(null);
+  const regionLayerRef = useRef(null);
   const dragRef = useRef(null);
+  const settingsDialogRef = useRef(null);
+  const settingsDialogDragRef = useRef(null);
   const sendTimerRef = useRef(null);
   const drawRafRef = useRef(null);
   const drawContextRef = useRef(null);
@@ -332,25 +472,100 @@ function App() {
   const lastFrameAtRef = useRef(0);
   const autoReconnectCountRef = useRef(0);
   const desiredStreamingRef = useRef(false);
+  const streamingProfileIdRef = useRef('');
   const showVideoSettingsRef = useRef(false);
   const lastDisplayFrameAtRef = useRef(0);
+  const lastRegionValuesAtRef = useRef(0);
   const imageVersionRef = useRef(0);
   const settingsVersionRef = useRef(0);
   const drawStateRef = useRef({
     imageVersion: -1,
     settingsVersion: -1,
     claheAt: 0,
+    renderedAt: 0,
   });
+  const frameSizeRef = useRef({ width: 0, height: 0 });
+  const prevShowVideoSettingsRef = useRef(showVideoSettings);
+  const lastDisplayFrameTsRef = useRef(0);
+  const fpsEmaRef = useRef(0);
+  const [mediaRect, setMediaRect] = useState({ x: 0, y: 0, width: 0, height: 0 });
+  const [streamingProfileId, setStreamingProfileId] = useState('');
 
   const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
   const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
   const isFiniteNumber = (value) => Number.isFinite(value);
+  const clampSettingsDialogPosition = useCallback((left, top) => {
+    const node = settingsDialogRef.current;
+    const dialogWidth = node?.offsetWidth ?? Math.min(SETTINGS_DIALOG_DEFAULT_WIDTH, Math.max(320, window.innerWidth - 24));
+    const dialogHeight = node?.offsetHeight ?? Math.min(760, window.innerHeight - 24);
+    const minLeft = 8;
+    const minTop = 8;
+    const maxLeft = Math.max(minLeft, window.innerWidth - dialogWidth - 8);
+    const maxTop = Math.max(minTop, window.innerHeight - dialogHeight - 8);
+    return {
+      left: clamp(left, minLeft, maxLeft),
+      top: clamp(top, minTop, maxTop),
+    };
+  }, []);
   const getFrameSize = () => {
-    if (!streamRef.current) return null;
-    const rect = streamRef.current.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return null;
-    return { width: rect.width, height: rect.height };
+    if (mediaRect.width > 0 && mediaRect.height > 0) {
+      return { width: mediaRect.width, height: mediaRect.height };
+    }
+    return null;
   };
+  const getInteractionRect = () => {
+    if (regionLayerRef.current) {
+      const rect = regionLayerRef.current.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) return rect;
+    }
+    if (streamRef.current) {
+      const rect = streamRef.current.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) return rect;
+    }
+    return null;
+  };
+
+  const computeMediaRect = useCallback(() => {
+    const container = streamRef.current;
+    if (!container) {
+      setMediaRect({ x: 0, y: 0, width: 0, height: 0 });
+      return;
+    }
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      setMediaRect({ x: 0, y: 0, width: 0, height: 0 });
+      return;
+    }
+
+    const image = sourceImageRef.current;
+    const canvas = streamCanvasRef.current;
+    const sourceWidth = image?.naturalWidth || canvas?.width || 0;
+    const sourceHeight = image?.naturalHeight || canvas?.height || 0;
+    if (!sourceWidth || !sourceHeight) {
+      setMediaRect({ x: 0, y: 0, width: rect.width, height: rect.height });
+      return;
+    }
+
+    const containerRatio = rect.width / rect.height;
+    const mediaRatio = sourceWidth / sourceHeight;
+    let drawWidth = rect.width;
+    let drawHeight = rect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+    if (mediaRatio > containerRatio) {
+      drawHeight = rect.width / mediaRatio;
+      offsetY = 0;
+    } else {
+      drawWidth = rect.height * mediaRatio;
+      offsetX = (rect.width - drawWidth) / 2;
+    }
+    setMediaRect({
+      x: Math.max(0, offsetX),
+      y: Math.max(0, offsetY),
+      width: Math.max(1, drawWidth),
+      height: Math.max(1, drawHeight),
+    });
+  }, []);
 
   const sanitizeRegions = (list) => {
     if (!Array.isArray(list)) return [];
@@ -366,13 +581,56 @@ function App() {
       }))
       .filter((region) => region.w > 0 && region.h > 0);
   };
+  const normalizeRegionsForWs = (regionList) => {
+    const frameSize = getFrameSize();
+    if (!Array.isArray(regionList)) return [];
+    if (!frameSize || frameSize.width <= 0 || frameSize.height <= 0) {
+      return regionList
+        .map((region) => ({
+          id: region.id,
+          name: region.name,
+          x: Number(region.x),
+          y: Number(region.y),
+          w: Number(region.w),
+          h: Number(region.h),
+          color: region.color,
+        }))
+        .filter((region) =>
+          isFiniteNumber(region.x) &&
+          isFiniteNumber(region.y) &&
+          isFiniteNumber(region.w) &&
+          isFiniteNumber(region.h)
+        );
+    }
+    const { width, height } = frameSize;
+    return regionList
+      .map((region) => ({
+        id: region.id,
+        name: region.name,
+        x: clamp((Number(region.x) / width) * 100, 0, 100),
+        y: clamp((Number(region.y) / height) * 100, 0, 100),
+        w: clamp((Number(region.w) / width) * 100, 1, 100),
+        h: clamp((Number(region.h) / height) * 100, 1, 100),
+        color: region.color,
+      }))
+      .filter((region) =>
+        isFiniteNumber(region.x) &&
+        isFiniteNumber(region.y) &&
+        isFiniteNumber(region.w) &&
+        isFiniteNumber(region.h)
+      );
+  };
   const activeCameraProfile = cameraProfiles.find((p) => p.id === activeCameraProfileId) || null;
   const activeCameraName = activeCameraProfile?.name || 'default';
+  const displayZoomPct = sourceSize.width > 0
+    ? Math.max(1, Math.round((mediaRect.width / sourceSize.width) * 100))
+    : 100;
 
   const shouldUpdateDisplayFrame = () => {
-    if (!showVideoSettingsRef.current) return true;
     const now = performance.now();
-    if (now - lastDisplayFrameAtRef.current < ADJUSTING_PREVIEW_INTERVAL_MS) return false;
+    const targetFps = showVideoSettingsRef.current ? ADJUSTING_PREVIEW_FPS : NORMAL_PREVIEW_FPS;
+    const intervalMs = 1000 / targetFps;
+    if (now - lastDisplayFrameAtRef.current < intervalMs) return false;
     lastDisplayFrameAtRef.current = now;
     return true;
   };
@@ -453,9 +711,11 @@ function App() {
     }
 
     desiredStreamingRef.current = true;
+    streamingProfileIdRef.current = activeCameraProfileId;
+    setStreamingProfileId(activeCameraProfileId);
     // 新規 WebSocket 接続
     setConnectionStatus('connecting', '接続中...');
-    const socket = new WebSocket('ws://localhost:5050/ws/stream');
+    const socket = new WebSocket(`${WS_BASE_URL}/ws/stream`);
     ws.current = socket;
 
     socket.onopen = () => {
@@ -465,10 +725,12 @@ function App() {
         type: 'start',
         source: target,
         cameraName: activeCameraName,
-        regions,
+        regions: normalizeRegionsForWs(regions),
         model: selectedModel || undefined,
         preprocess: toPreprocessPayload(videoSettings),
+        detectionSettings: toDetectionSettingsPayload(detectionSettings),
         previewPreprocess: showVideoSettings,
+        showInferenceOverlay: !hideInferenceResults,
       }));
       setConnectionStatus('connecting', '開始要求を送信しました...');
       clearStartTimeout();
@@ -486,6 +748,35 @@ function App() {
     socket.onmessage = (event) => {
       if (ws.current !== socket) return;
       const msg = event.data;
+      if (typeof msg !== 'string') return;
+
+      const handleIncomingFrame = (rawBase64) => {
+        const frameData = `data:image/jpeg;base64,${rawBase64}`;
+        latestImageDataRef.current = frameData;
+        clearFirstFrameTimeout();
+        lastFrameAtRef.current = Date.now();
+        autoReconnectCountRef.current = 0;
+        if (connectionStateRef.current !== 'streaming') {
+          clearStartTimeout();
+          setConnectionStatus('streaming', 'ストリーミング中');
+          setIsStreaming(true);
+          setStreamingProfileId(streamingProfileIdRef.current || activeCameraProfileId);
+        }
+        if (activeTabRef.current === 'stream' && shouldUpdateDisplayFrame()) {
+          const now = performance.now();
+          if (lastDisplayFrameTsRef.current > 0) {
+            const delta = now - lastDisplayFrameTsRef.current;
+            if (delta > 0) {
+              const instant = 1000 / delta;
+              fpsEmaRef.current = fpsEmaRef.current > 0 ? fpsEmaRef.current * 0.85 + instant * 0.15 : instant;
+              setDisplayFps(fpsEmaRef.current);
+            }
+          }
+          lastDisplayFrameTsRef.current = now;
+          setImageData(frameData);
+        }
+      };
+
       if (msg.startsWith('ERROR')) {
         clearStartTimeout();
         clearStopTimeout();
@@ -494,7 +785,9 @@ function App() {
         alert(msg);
         return;
       }
-      try {
+      const isLikelyJson = msg.startsWith('{') || msg.startsWith('[');
+      if (isLikelyJson) {
+        try {
         const payload = JSON.parse(msg);
         if (payload && payload.type === 'status') {
           const state = payload.state || '';
@@ -506,6 +799,7 @@ function App() {
             clearStartTimeout();
             setConnectionStatus('streaming', statusMessage || 'ストリーミング中');
             setIsStreaming(true);
+            setStreamingProfileId(streamingProfileIdRef.current || activeCameraProfileId);
             lastFrameAtRef.current = Date.now();
             clearFirstFrameTimeout();
             firstFrameTimeoutRef.current = window.setTimeout(() => {
@@ -525,6 +819,10 @@ function App() {
             clearFirstFrameTimeout();
             setConnectionStatus('idle', '');
             setIsStreaming(false);
+            if (!desiredStreamingRef.current) {
+              streamingProfileIdRef.current = '';
+              setStreamingProfileId('');
+            }
             if (desiredStreamingRef.current) {
               scheduleAutoReconnect('ストリームが停止しました');
             }
@@ -534,28 +832,23 @@ function App() {
             clearFirstFrameTimeout();
             setConnectionStatus('error', statusMessage || 'ストリームエラー');
             setIsStreaming(false);
+            if (!desiredStreamingRef.current) {
+              streamingProfileIdRef.current = '';
+              setStreamingProfileId('');
+            }
             scheduleAutoReconnect(statusMessage || 'ストリームエラー');
           }
           return;
         }
         if (payload.image) {
-          clearFirstFrameTimeout();
-          lastFrameAtRef.current = Date.now();
-          autoReconnectCountRef.current = 0;
-          const frameData = `data:image/jpeg;base64,${payload.image}`;
-          latestImageDataRef.current = frameData;
-          if (connectionStateRef.current !== 'streaming') {
-            clearStartTimeout();
-            setConnectionStatus('streaming', 'ストリーミング中');
-            setIsStreaming(true);
-          }
-          if (activeTabRef.current === 'stream') {
-            if (shouldUpdateDisplayFrame()) {
-              setImageData(frameData);
-            }
-          }
+          handleIncomingFrame(payload.image);
         }
         if (Array.isArray(payload.results)) {
+          const now = performance.now();
+          if (now - lastRegionValuesAtRef.current < (1000 / REGION_VALUES_UPDATE_FPS)) {
+            return;
+          }
+          lastRegionValuesAtRef.current = now;
           const nextValues = {};
           payload.results.forEach((item) => {
             if (item && item.id) {
@@ -564,6 +857,11 @@ function App() {
           });
           setRegionValues(nextValues);
         } else if (Array.isArray(payload.counts)) {
+          const now = performance.now();
+          if (now - lastRegionValuesAtRef.current < (1000 / REGION_VALUES_UPDATE_FPS)) {
+            return;
+          }
+          lastRegionValuesAtRef.current = now;
           const nextValues = {};
           payload.counts.forEach((item) => {
             if (item && item.id) {
@@ -573,25 +871,11 @@ function App() {
           setRegionValues(nextValues);
         }
         return;
-      } catch (error) {
-        // non-JSON payload fallback
-      }
-      // Base64 JPEG を受け取って表示
-      const frameData = `data:image/jpeg;base64,${msg}`;
-      latestImageDataRef.current = frameData;
-      clearFirstFrameTimeout();
-      lastFrameAtRef.current = Date.now();
-      autoReconnectCountRef.current = 0;
-      if (connectionStateRef.current !== 'streaming') {
-        clearStartTimeout();
-        setConnectionStatus('streaming', 'ストリーミング中');
-        setIsStreaming(true);
-      }
-      if (activeTabRef.current === 'stream') {
-        if (shouldUpdateDisplayFrame()) {
-          setImageData(frameData);
+        } catch (error) {
+          // non-JSON payload fallback
         }
       }
+      handleIncomingFrame(msg);
     };
 
     socket.onerror = (err) => {
@@ -612,6 +896,10 @@ function App() {
         clearStopTimeout();
         clearFirstFrameTimeout();
         setIsStreaming(false);
+        if (!desiredStreamingRef.current) {
+          streamingProfileIdRef.current = '';
+          setStreamingProfileId('');
+        }
         if (connectionStateRef.current !== 'error') {
           setConnectionStatus('idle', '');
         }
@@ -638,7 +926,7 @@ function App() {
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const response = await fetch('http://localhost:5050/models');
+        const response = await fetch(`${API_BASE_URL}/models`);
         if (!response.ok) return;
         const data = await response.json();
         if (Array.isArray(data.models)) {
@@ -657,8 +945,10 @@ function App() {
   useEffect(() => {
     const legacyRegionsRaw = window.localStorage.getItem(REGION_STORAGE_KEY);
     const legacySettingsRaw = window.localStorage.getItem(VIDEO_SETTINGS_STORAGE_KEY);
+    const lastUsedRaw = window.localStorage.getItem(LAST_USED_CAMERA_SETTINGS_KEY);
     let legacyRegions = [];
     let legacySettings = DEFAULT_VIDEO_SETTINGS;
+    let lastUsedSettings = null;
     try {
       legacyRegions = sanitizeRegions(JSON.parse(legacyRegionsRaw || '[]'));
     } catch (error) {
@@ -668,6 +958,11 @@ function App() {
       legacySettings = sanitizeVideoSettings(JSON.parse(legacySettingsRaw || '{}'));
     } catch (error) {
       console.warn('Failed to parse video settings', error);
+    }
+    try {
+      lastUsedSettings = sanitizeLastUsedCameraSettings(JSON.parse(lastUsedRaw || 'null'));
+    } catch (error) {
+      console.warn('Failed to parse last used camera settings', error);
     }
 
     const rawProfiles = window.localStorage.getItem(CAMERA_PROFILES_KEY);
@@ -695,11 +990,33 @@ function App() {
         model: '',
         regions: legacyRegions,
         videoSettings: legacySettings,
+        detectionSettings: DEFAULT_DETECTION_SETTINGS,
       }, 'default')];
     }
 
     const storedActiveId = window.localStorage.getItem(ACTIVE_CAMERA_PROFILE_KEY) || '';
-    const activeId = profiles.some((p) => p.id === storedActiveId) ? storedActiveId : profiles[0].id;
+    let activeId = profiles.some((p) => p.id === storedActiveId) ? storedActiveId : profiles[0].id;
+    if (lastUsedSettings) {
+      const preferredId = lastUsedSettings.activeCameraProfileId;
+      const targetId = profiles.some((p) => p.id === preferredId) ? preferredId : activeId;
+      profiles = profiles.map((profile) => (
+        profile.id === targetId
+          ? sanitizeCameraProfile(
+            {
+              ...profile,
+              sourceType: lastUsedSettings.sourceType,
+              streamUrl: lastUsedSettings.streamUrl,
+              deviceIndex: lastUsedSettings.deviceIndex,
+              model: lastUsedSettings.model || profile.model,
+              videoSettings: lastUsedSettings.videoSettings,
+              detectionSettings: lastUsedSettings.detectionSettings,
+            },
+            profile.name || 'camera',
+          )
+          : profile
+      ));
+      activeId = targetId;
+    }
 
     setCameraProfiles(profiles);
     setActiveCameraProfileId(activeId);
@@ -712,11 +1029,14 @@ function App() {
     setDeviceIndex(activeCameraProfile.deviceIndex);
     setRegions(sanitizeRegions(activeCameraProfile.regions));
     setVideoSettings(sanitizeVideoSettings(activeCameraProfile.videoSettings));
+    setDetectionSettings(sanitizeDetectionSettings(activeCameraProfile.detectionSettings));
     setSelectedModel(activeCameraProfile.model || modelOptions[0] || '');
   }, [activeCameraProfileId, modelOptions]);
 
   const stopStream = () => {
     desiredStreamingRef.current = false;
+    streamingProfileIdRef.current = '';
+    setStreamingProfileId('');
     clearStartTimeout();
     clearStopTimeout();
     clearFirstFrameTimeout();
@@ -827,6 +1147,13 @@ function App() {
     }));
   };
 
+  const updateDetectionSetting = (key, value) => {
+    setDetectionSettings((prev) => sanitizeDetectionSettings({
+      ...prev,
+      [key]: value,
+    }));
+  };
+
   const resetVideoSettings = () => {
     setVideoSettings(DEFAULT_VIDEO_SETTINGS);
   };
@@ -849,23 +1176,25 @@ function App() {
       model: selectedModel || '',
       regions: [],
       videoSettings: DEFAULT_VIDEO_SETTINGS,
+      detectionSettings: DEFAULT_DETECTION_SETTINGS,
     }, trimmed);
     setCameraProfiles((prev) => [...prev, newProfile]);
     setActiveCameraProfileId(newProfile.id);
-    setShowCameraSettingsDetails(true);
   };
 
-  const deleteCameraProfile = () => {
+  const deleteCameraProfile = (targetId = activeCameraProfileId) => {
     if (cameraProfiles.length <= 1) {
       alert('最後の1件は削除できません。');
       return;
     }
-    const target = activeCameraProfile;
+    const target = cameraProfiles.find((profile) => profile.id === targetId) || null;
     if (!target) return;
     if (!window.confirm(`カメラ設定「${target.name}」を削除しますか？`)) return;
     const nextProfiles = cameraProfiles.filter((p) => p.id !== target.id);
     setCameraProfiles(nextProfiles);
-    setActiveCameraProfileId(nextProfiles[0]?.id || '');
+    if (activeCameraProfileId === target.id) {
+      setActiveCameraProfileId(nextProfiles[0]?.id || '');
+    }
   };
 
   const updateActiveCameraProfileName = (name) => {
@@ -881,9 +1210,8 @@ function App() {
   };
 
   const handleStreamClick = (event) => {
-    if (!streamRef.current) return;
-    const rect = streamRef.current.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
+    const rect = getInteractionRect();
+    if (!rect) return;
     const normalizedX = clamp((event.clientX - rect.left) / rect.width, 0, 1);
     const normalizedY = clamp((event.clientY - rect.top) / rect.height, 0, 1);
     setVideoSettings((prev) => ({
@@ -915,6 +1243,122 @@ function App() {
     return blob;
   };
 
+  const captureDisplayedFramePngBlob = async () => {
+    if (showVideoSettings) {
+      const canvas = streamCanvasRef.current;
+      if (!canvas || canvas.width <= 0 || canvas.height <= 0) {
+        throw new Error('調整映像を取得できません。');
+      }
+      const canvasBlob = await new Promise((resolve, reject) => {
+        canvas.toBlob((blob) => {
+          if (!blob || blob.size === 0) {
+            reject(new Error('調整映像の画像化に失敗しました。'));
+            return;
+          }
+          resolve(blob);
+        }, 'image/png');
+      });
+      return canvasBlob;
+    }
+
+    const rawBlob = await captureCurrentFrameBlob();
+    const rawDataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result !== 'string' || !reader.result) {
+          reject(new Error('フレームの読込に失敗しました。'));
+          return;
+        }
+        resolve(reader.result);
+      };
+      reader.onerror = () => reject(new Error('フレームの読込に失敗しました。'));
+      reader.readAsDataURL(rawBlob);
+    });
+
+    const pngBlob = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('画像変換に失敗しました。'));
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob((blob) => {
+          if (!blob || blob.size === 0) {
+            reject(new Error('PNG変換に失敗しました。'));
+            return;
+          }
+          resolve(blob);
+        }, 'image/png');
+      };
+      img.onerror = () => reject(new Error('フレーム画像の読み込みに失敗しました。'));
+      img.src = rawDataUrl;
+    });
+    return pngBlob;
+  };
+
+  const saveTestModeCapture = async () => {
+    if (testCaptureSaving) return;
+    setTestCaptureMessage('');
+    setTestCaptureSaving(true);
+    try {
+      const frameBlob = await captureDisplayedFramePngBlob();
+      const formData = new FormData();
+      formData.append('image', frameBlob, 'capture.png');
+      formData.append('save_dir', testCaptureSaveDir.trim());
+      formData.append('save_dir_abs', testCaptureSaveDirAbs.trim());
+      const response = await fetch(`${API_BASE_URL}/api/v1/test-mode/capture`, {
+        method: 'POST',
+        body: formData,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = typeof payload.detail === 'string' ? payload.detail : '保存に失敗しました。';
+        throw new Error(detail);
+      }
+      const savedPath = typeof payload.abs_path === 'string'
+        ? payload.abs_path
+        : (typeof payload.path === 'string' ? payload.path : '');
+      setTestCaptureMessage(savedPath ? `保存完了: ${savedPath}` : '保存完了');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '保存に失敗しました。';
+      setTestCaptureMessage(`保存失敗: ${message}`);
+    } finally {
+      setTestCaptureSaving(false);
+    }
+  };
+
+  const pickTestModeSaveDir = async () => {
+    if (testCaptureSelectingDir) return;
+    setTestCaptureSelectingDir(true);
+    setTestCaptureMessage('');
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/test-mode/select-save-dir`, {
+        method: 'POST',
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = typeof payload.detail === 'string' ? payload.detail : '保存先の選択に失敗しました。';
+        throw new Error(detail);
+      }
+      const selectedDir = typeof payload.selected_dir === 'string' ? payload.selected_dir : '';
+      if (!selectedDir) {
+        throw new Error('保存先の選択に失敗しました。');
+      }
+      setTestCaptureSaveDirAbs(selectedDir);
+      setTestCaptureMessage(`保存先を選択: ${selectedDir}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '保存先の選択に失敗しました。';
+      setTestCaptureMessage(`保存先選択失敗: ${message}`);
+    } finally {
+      setTestCaptureSelectingDir(false);
+    }
+  };
+
   const runInferenceWithCurrentFrame = async () => {
     if (inferLoading) return;
     setInferError('');
@@ -931,8 +1375,9 @@ function App() {
           formData.append('meter_id', activeCameraName);
           formData.append('model_type', 'yolo');
           formData.append('preprocess', preprocessPayload);
+          formData.append('detection_settings', JSON.stringify(toDetectionSettingsPayload(detectionSettings)));
 
-          const response = await fetch('http://localhost:5050/api/v1/images', {
+          const response = await fetch(`${API_BASE_URL}/api/v1/images`, {
             method: 'POST',
             body: formData,
           });
@@ -1013,16 +1458,10 @@ function App() {
     }
   };
 
-  const drawAdjustedFrame = (ctx, canvas, image, settings) => {
+  const drawAdjustedFrame = (ctx, canvas, image, settings, localPreviewEnabled) => {
     const sourceWidth = image.naturalWidth || image.videoWidth || image.width;
     const sourceHeight = image.naturalHeight || image.videoHeight || image.height;
     if (!sourceWidth || !sourceHeight) return;
-    if (canvas.width !== sourceWidth || canvas.height !== sourceHeight) {
-      canvas.width = sourceWidth;
-      canvas.height = sourceHeight;
-    }
-    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-
     if (!settings) return;
     const hasAdjustments = (
       Math.abs(settings.brightness - 1) > 0.001
@@ -1031,15 +1470,37 @@ function App() {
       || Math.abs(settings.sharpness) > 0.001
       || Math.abs(settings.highlightSuppression) > 0.001
       || Math.abs(settings.highlightRecovery) > 0.001
+      || Boolean(settings.binarizationEnabled)
       || Boolean(settings.claheEnabled)
     );
+
+    const previewMaxWidth = localPreviewEnabled ? HEAVY_PREVIEW_MAX_WIDTH : NORMAL_PREVIEW_MAX_WIDTH;
+    const renderScale = Math.min(1, previewMaxWidth / sourceWidth);
+    const renderWidth = Math.max(1, Math.round(sourceWidth * renderScale));
+    const renderHeight = Math.max(1, Math.round(sourceHeight * renderScale));
+    if (canvas.width !== renderWidth || canvas.height !== renderHeight) {
+      canvas.width = renderWidth;
+      canvas.height = renderHeight;
+    }
+    ctx.drawImage(image, 0, 0, renderWidth, renderHeight);
+
+    if (!localPreviewEnabled) return;
     if (!hasAdjustments) return;
 
     const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const data = frame.data;
     applyBasicAdjustments(data, settings.brightness, settings.contrast, settings.gamma);
-    applyHighlightRecovery(data, canvas.width, canvas.height, settings.highlightRecovery);
+    applyHighlightRecovery(
+      data,
+      canvas.width,
+      canvas.height,
+      settings.highlightRecovery,
+      settings.highlightRecoveryCurve
+    );
     applyHighlightSuppression(data, settings.highlightSuppression);
+    if (settings.binarizationEnabled) {
+      applyBinarization(data, settings.binarizationThreshold);
+    }
     if (settings.claheEnabled) {
       applyClaheToLuma(data, canvas.width, canvas.height, settings.claheClipLimit, settings.claheTileGridSize);
     }
@@ -1051,10 +1512,11 @@ function App() {
     if (!activeAction) return;
 
     const handleMove = (event) => {
-      if (!streamRef.current || !dragRef.current) return;
+      event.preventDefault();
+      if (!dragRef.current) return;
       const drag = dragRef.current;
-      const rect = streamRef.current.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return;
+      const rect = getInteractionRect();
+      if (!rect) return;
       const rawX = event.clientX - rect.left;
       const rawY = event.clientY - rect.top;
       if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
@@ -1098,26 +1560,10 @@ function App() {
 
   useEffect(() => {
     if (!isStreaming || !ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-    const frameSize = getFrameSize();
-    if (!frameSize) return;
-    const { width, height } = frameSize;
     if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
     sendTimerRef.current = setTimeout(() => {
       if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-      const sanitized = regions
-        .map((region) => ({
-          ...region,
-          x: clamp((region.x / width) * 100, 0, 100),
-          y: clamp((region.y / height) * 100, 0, 100),
-          w: clamp((region.w / width) * 100, 1, 100),
-          h: clamp((region.h / height) * 100, 1, 100),
-        }))
-        .filter((region) =>
-          isFiniteNumber(region.x) &&
-          isFiniteNumber(region.y) &&
-          isFiniteNumber(region.w) &&
-          isFiniteNumber(region.h)
-        );
+      const sanitized = normalizeRegionsForWs(regions);
       ws.current.send(JSON.stringify({
         type: 'regions',
         regions: sanitized,
@@ -1142,6 +1588,7 @@ function App() {
 
   useEffect(() => {
     if (!activeCameraProfileId) return;
+    if (activeAction) return;
     setCameraProfiles((prev) => prev.map((profile) => (
       profile.id === activeCameraProfileId
         ? {
@@ -1152,6 +1599,7 @@ function App() {
             model: selectedModel,
             regions,
             videoSettings,
+            detectionSettings,
           }
         : profile
     )));
@@ -1163,6 +1611,8 @@ function App() {
     selectedModel,
     regions,
     videoSettings,
+    detectionSettings,
+    activeAction,
   ]);
 
   useEffect(() => {
@@ -1176,14 +1626,88 @@ function App() {
   }, [activeCameraProfileId]);
 
   useEffect(() => {
+    window.localStorage.setItem(CAMERA_SIDEBAR_COLLAPSED_KEY, isCameraSidebarCollapsed ? '1' : '0');
+  }, [isCameraSidebarCollapsed]);
+
+  useEffect(() => {
+    if (!activeCameraProfileId) return;
+    window.localStorage.setItem(
+      LAST_USED_CAMERA_SETTINGS_KEY,
+      JSON.stringify({
+        activeCameraProfileId,
+        sourceType,
+        streamUrl,
+        deviceIndex,
+        model: selectedModel,
+        videoSettings,
+        detectionSettings,
+      }),
+    );
+  }, [
+    activeCameraProfileId,
+    sourceType,
+    streamUrl,
+    deviceIndex,
+    selectedModel,
+    videoSettings,
+    detectionSettings,
+  ]);
+
+  useEffect(() => {
+    window.localStorage.setItem(TEST_CAPTURE_SAVE_DIR_KEY, testCaptureSaveDir);
+  }, [testCaptureSaveDir]);
+
+  useEffect(() => {
+    window.localStorage.setItem(TEST_CAPTURE_SAVE_DIR_ABS_KEY, testCaptureSaveDirAbs);
+  }, [testCaptureSaveDirAbs]);
+
+  useEffect(() => {
+    const flushCurrentSettings = () => {
+      if (!activeCameraProfileId) return;
+      const mergedProfiles = cameraProfiles.map((profile) => (
+        profile.id === activeCameraProfileId
+          ? {
+              ...profile,
+              sourceType,
+              streamUrl,
+              deviceIndex,
+              model: selectedModel,
+              regions,
+              videoSettings,
+              detectionSettings,
+            }
+          : profile
+      ));
+      window.localStorage.setItem(CAMERA_PROFILES_KEY, JSON.stringify(mergedProfiles));
+      window.localStorage.setItem(ACTIVE_CAMERA_PROFILE_KEY, activeCameraProfileId);
+    };
+    window.addEventListener('beforeunload', flushCurrentSettings);
+    return () => {
+      window.removeEventListener('beforeunload', flushCurrentSettings);
+    };
+  }, [
+    cameraProfiles,
+    activeCameraProfileId,
+    sourceType,
+    streamUrl,
+    deviceIndex,
+    selectedModel,
+    regions,
+    videoSettings,
+    detectionSettings,
+  ]);
+
+  useEffect(() => {
     if (!isStreaming) return;
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
     ws.current.send(JSON.stringify({
       type: 'preprocess',
       preprocess: toPreprocessPayload(videoSettings),
+      detectionSettings: toDetectionSettingsPayload(detectionSettings),
       previewPreprocess: showVideoSettings,
+      showInferenceOverlay: !hideInferenceResults,
     }));
-  }, [videoSettings, isStreaming, showVideoSettings]);
+  }, [videoSettings, detectionSettings, isStreaming, showVideoSettings, hideInferenceResults]);
 
   useEffect(() => {
     showVideoSettingsRef.current = showVideoSettings;
@@ -1193,8 +1717,51 @@ function App() {
   }, [showVideoSettings]);
 
   useEffect(() => {
+    computeMediaRect();
+  }, [imageData, activeTab, computeMediaRect]);
+
+  useEffect(() => {
+    if (activeTab !== 'stream') return undefined;
+    const node = streamRef.current;
+    if (!node) return undefined;
+    const observer = new ResizeObserver(() => {
+      computeMediaRect();
+    });
+    observer.observe(node);
+    window.addEventListener('resize', computeMediaRect);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', computeMediaRect);
+    };
+  }, [activeTab, computeMediaRect]);
+
+  useEffect(() => {
+    const toggledAdjustPanel = prevShowVideoSettingsRef.current !== showVideoSettings;
+    prevShowVideoSettingsRef.current = showVideoSettings;
+    if (toggledAdjustPanel) return;
+    if (mediaRect.width <= 0 || mediaRect.height <= 0) return;
+    const prev = frameSizeRef.current;
+    if (prev.width > 0 && prev.height > 0) {
+      const resized = Math.abs(prev.width - mediaRect.width) > 2 || Math.abs(prev.height - mediaRect.height) > 2;
+      if (resized) {
+        const scaleX = mediaRect.width / prev.width;
+        const scaleY = mediaRect.height / prev.height;
+        setRegions((current) => current.map((region) => ({
+          ...region,
+          x: clamp(region.x * scaleX, 0, Math.max(mediaRect.width - 20, 0)),
+          y: clamp(region.y * scaleY, 0, Math.max(mediaRect.height - 20, 0)),
+          w: clamp(region.w * scaleX, 20, Math.max(mediaRect.width, 20)),
+          h: clamp(region.h * scaleY, 20, Math.max(mediaRect.height, 20)),
+        })));
+      }
+    }
+    frameSizeRef.current = { width: mediaRect.width, height: mediaRect.height };
+  }, [mediaRect.width, mediaRect.height, showVideoSettings]);
+
+  useEffect(() => {
     activeTabRef.current = activeTab;
     if (activeTab === 'stream' && latestImageDataRef.current) {
+      lastDisplayFrameAtRef.current = 0;
       setImageData(latestImageDataRef.current);
     }
   }, [activeTab]);
@@ -1220,6 +1787,62 @@ function App() {
   }, [videoSettings]);
 
   useEffect(() => {
+    if (!showSettingsDialog) return undefined;
+    const resetPositionToRight = () => {
+      const node = settingsDialogRef.current;
+      const dialogWidth = node?.offsetWidth ?? Math.min(SETTINGS_DIALOG_DEFAULT_WIDTH, Math.max(320, window.innerWidth - 24));
+      const initialLeft = window.innerWidth - dialogWidth - 24;
+      const initialTop = 64;
+      setSettingsDialogPosition(clampSettingsDialogPosition(initialLeft, initialTop));
+    };
+    const rafId = window.requestAnimationFrame(resetPositionToRight);
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setShowSettingsDialog(false);
+      }
+    };
+    const handleResize = () => {
+      setSettingsDialogPosition((prev) => clampSettingsDialogPosition(prev.left, prev.top));
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('resize', handleResize);
+      settingsDialogDragRef.current = null;
+      setIsSettingsDialogDragging(false);
+    };
+  }, [showSettingsDialog, clampSettingsDialogPosition]);
+
+  useEffect(() => {
+    if (!showSettingsDialog || !isSettingsDialogDragging) return undefined;
+    const handleMouseMove = (event) => {
+      if (!settingsDialogDragRef.current) return;
+      const nextLeft = event.clientX - settingsDialogDragRef.current.offsetX;
+      const nextTop = event.clientY - settingsDialogDragRef.current.offsetY;
+      setSettingsDialogPosition(clampSettingsDialogPosition(nextLeft, nextTop));
+    };
+    const handleMouseUp = () => {
+      settingsDialogDragRef.current = null;
+      setIsSettingsDialogDragging(false);
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [showSettingsDialog, isSettingsDialogDragging, clampSettingsDialogPosition]);
+
+  useEffect(() => {
+    if (activeTab !== 'stream' || !showVideoSettings) return undefined;
+    drawStateRef.current = {
+      imageVersion: -1,
+      settingsVersion: -1,
+      claheAt: 0,
+      renderedAt: 0,
+    };
     const render = () => {
       const canvas = streamCanvasRef.current;
       const image = sourceImageRef.current;
@@ -1234,12 +1857,21 @@ function App() {
           const settingsChanged = state.settingsVersion !== settingsVersionRef.current;
           if (imageChanged || settingsChanged) {
             const now = performance.now();
-            const claheIntervalMs = videoSettings.claheEnabled ? 250 : 0;
+            const localPreviewEnabled = true;
+            const targetFps = ADJUSTING_PREVIEW_FPS;
+            const renderIntervalMs = 1000 / targetFps;
+            const shouldSkipRender = !settingsChanged && now - state.renderedAt < renderIntervalMs;
+            if (shouldSkipRender) {
+              drawRafRef.current = window.requestAnimationFrame(render);
+              return;
+            }
+            const claheIntervalMs = localPreviewEnabled && videoSettings.claheEnabled ? 250 : 0;
             const canRenderClahe = !videoSettings.claheEnabled || settingsChanged || now - state.claheAt >= claheIntervalMs;
             if (canRenderClahe) {
-              drawAdjustedFrame(ctx, canvas, image, videoSettings);
+              drawAdjustedFrame(ctx, canvas, image, videoSettings, localPreviewEnabled);
               state.imageVersion = imageVersionRef.current;
               state.settingsVersion = settingsVersionRef.current;
+              state.renderedAt = now;
               if (videoSettings.claheEnabled) state.claheAt = now;
             }
           }
@@ -1254,542 +1886,953 @@ function App() {
         drawRafRef.current = null;
       }
     };
-  }, [videoSettings]);
+  }, [videoSettings, activeTab, showVideoSettings]);
 
   return (
     <div className={`container${isStreaming ? ' streaming' : ''}`}>
-      <div className="tab-row">
-        <button
-          type="button"
-          className={`tab-button ${activeTab === 'stream' ? 'active' : ''}`}
-          onClick={() => setActiveTab('stream')}
+      <div className="tab-panels">
+        <section
+          className={`tab-panel stream-view${activeTab === 'stream' ? ' is-active' : ' is-hidden'}${isCameraSidebarCollapsed ? ' sidebar-collapsed' : ''}`}
+          aria-hidden={activeTab !== 'stream'}
         >
-          Stream
-        </button>
-        <button
-          type="button"
-          className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`}
-          onClick={() => setActiveTab('dashboard')}
-        >
-          Dashboard
-        </button>
-      </div>
-
-      {activeTab === 'dashboard' ? (
-        <DashboardPage />
-      ) : (
-        <>
           <header className="hero">
             <div className="hero-layout">
               <div className="hero-copy">
-                <p className="eyebrow">Realtime Vision</p>
-                <h2>Live Stream Viewer</h2>
-                <p className="subhead">
-                  カメラまたはストリームURLに接続して、YOLOv8の検出結果をリアルタイムで確認できます。
-                </p>
-              </div>
-              <form className="panel hero-settings" onSubmit={(event) => event.preventDefault()}>
-                <div className="controls">
-                  <label className="field">
-                    <span>カメラ設定</span>
-                    <select
-                      value={activeCameraProfileId}
-                      onChange={(e) => setActiveCameraProfileId(e.target.value)}
+                <div className="hero-topline">
+                  <p className="eyebrow">Realtime Vision</p>
+                  <div className="tab-row">
+                    <button
+                      type="button"
+                      className={`tab-button ${activeTab === 'stream' ? 'active' : ''}`}
+                      onClick={() => setActiveTab('stream')}
                     >
-                      {cameraProfiles.map((profile) => (
-                        <option key={profile.id} value={profile.id}>
-                          {profile.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <button
-                    className={`secondary details-toggle${showCameraSettingsDetails ? ' active' : ''}`}
-                    type="button"
-                    onClick={() => setShowCameraSettingsDetails((prev) => !prev)}
-                  >
-                    {showCameraSettingsDetails ? '▲ 設定詳細' : '▼ 設定詳細'}
-                  </button>
-                  <button
-                    className={`primary ${isStreaming ? 'danger' : ''}`}
-                    type="button"
-                    onClick={() => (isStreaming ? stopStream() : startStream())}
-                    disabled={connectionState === 'connecting' || connectionState === 'stopping'}
-                  >
-                    {connectionState === 'connecting'
-                      ? '接続中...'
-                      : connectionState === 'stopping'
-                        ? '停止中...'
-                        : isStreaming
-                          ? '停止'
-                          : 'ストリーム開始'}
-                  </button>
-                </div>
-                {showCameraSettingsDetails && (
-                  <div className="camera-settings-panel">
-                    <label className="field">
-                      <span>設定名</span>
-                      <input
-                        type="text"
-                        key={activeCameraProfileId}
-                        defaultValue={activeCameraName}
-                        onBlur={(e) => updateActiveCameraProfileName(e.target.value)}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>入力ソース</span>
-                      <select
-                        value={sourceType}
-                        onChange={(e) => setSourceType(e.target.value)}
-                      >
-                        <option value="url">HTTP/RTSP URL</option>
-                        <option value="device">Macbook カメラ</option>
-                      </select>
-                    </label>
-                    {sourceType === 'url' ? (
-                      <label className="field field-wide">
-                        <span>ストリームURL</span>
-                        <input
-                          type="text"
-                          value={streamUrl}
-                          placeholder="http:// または rtsp://"
-                          onChange={(e) => setStreamUrl(e.target.value)}
-                          required
-                        />
-                      </label>
-                    ) : (
-                      <label className="field field-wide">
-                        <span>デバイス</span>
-                        <select
-                          value={deviceIndex}
-                          onChange={(e) => setDeviceIndex(e.target.value)}
-                        >
-                          <option value="0">デバイス0（既定）</option>
-                          <option value="1">デバイス1</option>
-                        </select>
-                      </label>
-                    )}
-                    <label className="field">
-                      <span>モデル</span>
-                      <select
-                        value={selectedModel}
-                        onChange={(e) => setSelectedModel(e.target.value)}
-                      >
-                        {modelOptions.length === 0 ? (
-                          <option value="">読み込み中</option>
-                        ) : (
-                          modelOptions.map((name) => (
-                            <option key={name} value={name}>{name}</option>
-                          ))
-                        )}
-                      </select>
-                    </label>
-                    <div className="camera-settings-actions">
-                      <button className="secondary" type="button" onClick={createCameraProfile}>
-                        設定を作成 +
-                      </button>
-                      <button className="secondary" type="button" onClick={deleteCameraProfile}>
-                        設定を削除
-                      </button>
-                    </div>
-                  </div>
-                )}
-                {(connectionState !== 'idle' || connectionMessage) && (
-                  <p className={`muted connection-line state-${connectionState}`}>
-                    状態: {connectionState}
-                    {connectionMessage ? ` / ${connectionMessage}` : ''}
-                  </p>
-                )}
-              </form>
-            </div>
-          </header>
-          {/* 映像受信中/受信待ち中はプレビュー領域を表示 */}
-          {(imageData || isStreaming) && (
-            <div className="preview">
-              <div className="stream-column">
-                <div className="stream-header">
-                  <h3>{activeCameraName}</h3>
-                  <div className="stream-actions">
-                    <button className="ghost" type="button" onClick={addRegion}>
-                      領域作成 +
+                      Stream
+                    </button>
+                    <button
+                      type="button"
+                      className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`}
+                      onClick={() => setActiveTab('dashboard')}
+                    >
+                      Dashboard
+                    </button>
+                    <button
+                      type="button"
+                      className={`tab-button ${showSettingsDialog ? 'active' : ''}`}
+                      onClick={() => {
+                        setActiveSettingsTab('yolo');
+                        setShowSettingsDialog(true);
+                      }}
+                    >
+                      Setting
                     </button>
                   </div>
                 </div>
-                <div className="stream-frame" ref={streamRef}>
-                  {showVideoSettings && (
-                    <div className="stream-adjusting-indicator">映像調整中</div>
-                  )}
-                  <canvas
-                    ref={streamCanvasRef}
-                    className="stream-canvas"
-                    onClick={handleStreamClick}
-                  />
-                  {imageData ? (
-                    <img
-                      ref={sourceImageRef}
-                      src={imageData}
-                      alt="Live Stream"
-                      className="stream-source"
-                      onLoad={() => {
-                        imageVersionRef.current += 1;
-                      }}
-                    />
-                  ) : (
-                    <div className="stream-frame-placeholder">
-                      映像受信待ち...
+                <h2>Live Stream Viewer</h2>
+              </div>
+            </div>
+          </header>
+          <div className={`stream-workspace${isCameraSidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+              <aside className={`left-pane${isCameraSidebarCollapsed ? ' is-collapsed' : ''}`}>
+                <div className="left-pane-header">
+                  {!isCameraSidebarCollapsed && <h4>カメラ設定</h4>}
+                  <div className="left-pane-actions">
+                    {!isCameraSidebarCollapsed && (
+                      <button className="secondary" type="button" onClick={createCameraProfile}>
+                        設定を作成 +
+                      </button>
+                    )}
+                    <button
+                      className="secondary sidebar-toggle"
+                      type="button"
+                      onClick={() => setIsCameraSidebarCollapsed((prev) => !prev)}
+                      aria-label={isCameraSidebarCollapsed ? '左サイドバーを開く' : '左サイドバーを閉じる'}
+                    >
+                      {isCameraSidebarCollapsed ? '▶' : '◀'}
+                    </button>
+                  </div>
+                </div>
+                {!isCameraSidebarCollapsed && (
+                  <div className="camera-card-list">
+                    {cameraProfiles.map((profile) => {
+                      const isActiveProfile = profile.id === activeCameraProfileId;
+                      const summarySource = isActiveProfile ? sourceType : (profile.sourceType || 'url');
+                      const summaryDevice = summarySource === 'device'
+                        ? `device:${isActiveProfile ? deviceIndex : (profile.deviceIndex || '0')}`
+                        : (isActiveProfile ? (streamUrl || '-') : (profile.streamUrl || '-'));
+                      const summaryModel = isActiveProfile ? (selectedModel || '-') : (profile.model || '-');
+                      const summarySourceLabel = summarySource === 'device' ? 'デバイス' : 'URL';
+                      const summaryEndpointLabel = summarySource === 'device' ? 'デバイス' : 'ストリームURL';
+                      return (
+                        <article
+                          key={profile.id}
+                          className={`camera-card${isActiveProfile ? ' active' : ''}`}
+                        >
+                          <div className="camera-card-head">
+                            <button
+                              type="button"
+                              className="camera-card-summary"
+                              onClick={() => {
+                                setActiveCameraProfileId(profile.id);
+                                setShowCameraSettings(false);
+                              }}
+                            >
+                              <div className="camera-card-thumb">
+                                {isActiveProfile && isStreaming && streamingProfileId === profile.id && imageData ? (
+                                  <img src={imageData} alt={`${profile.name} preview`} />
+                                ) : (
+                                  <span>NO IMAGE</span>
+                                )}
+                              </div>
+                              <div className="camera-card-meta">
+                                <strong>{profile.name}</strong>
+                                <span>{isActiveProfile ? '選択中' : '未選択'}</span>
+                              </div>
+                            </button>
+                            <div className="camera-card-head-actions">
+                              <button
+                                type="button"
+                                className="secondary camera-toggle"
+                                onClick={() => {
+                                  if (!isActiveProfile) {
+                                    setActiveCameraProfileId(profile.id);
+                                    setShowCameraSettings(true);
+                                    return;
+                                  }
+                                  setShowCameraSettings((prev) => !prev);
+                                }}
+                              >
+                                {isActiveProfile && showCameraSettings ? '閉' : '開'}
+                              </button>
+                            </div>
+                          </div>
+                          {isActiveProfile && !showCameraSettings && (
+                            <div className="camera-card-summaryline">
+                              <div className="camera-card-titleline">
+                                <strong>{profile.name}</strong>
+                                <button
+                                  className={`primary camera-stream-toggle ${isStreaming ? 'danger' : ''}`}
+                                  type="button"
+                                  onClick={() => (isStreaming ? stopStream() : startStream())}
+                                  disabled={connectionState === 'connecting' || connectionState === 'stopping'}
+                                >
+                                  {connectionState === 'connecting'
+                                    ? '接続中...'
+                                    : connectionState === 'stopping'
+                                      ? '停止中...'
+                                      : isStreaming
+                                        ? '停止'
+                                        : 'ストリーム'}
+                                </button>
+                              </div>
+                              <span>入力ソース:{summarySourceLabel}</span>
+                              <span>{summaryEndpointLabel}:{summaryDevice}</span>
+                              <span>モデル:{summaryModel}</span>
+                            </div>
+                          )}
+                          {isActiveProfile && showCameraSettings && (
+                            <div className="camera-card-body">
+                              <label className="field">
+                                <span>設定名</span>
+                                <input
+                                  type="text"
+                                  key={activeCameraProfileId}
+                                  defaultValue={activeCameraName}
+                                  onBlur={(e) => updateActiveCameraProfileName(e.target.value)}
+                                />
+                              </label>
+                              <label className="field">
+                                <span>入力ソース</span>
+                                <select
+                                  value={sourceType}
+                                  onChange={(e) => setSourceType(e.target.value)}
+                                >
+                                  <option value="url">HTTP/RTSP URL</option>
+                                  <option value="device">Macbook カメラ</option>
+                                </select>
+                              </label>
+                              {sourceType === 'url' ? (
+                                <label className="field">
+                                  <span>ストリームURL</span>
+                                  <input
+                                    type="text"
+                                    value={streamUrl}
+                                    placeholder="http:// または rtsp://"
+                                    onChange={(e) => setStreamUrl(e.target.value)}
+                                    required
+                                  />
+                                </label>
+                              ) : (
+                                <label className="field">
+                                  <span>デバイス</span>
+                                  <select
+                                    value={deviceIndex}
+                                    onChange={(e) => setDeviceIndex(e.target.value)}
+                                  >
+                                    <option value="0">デバイス0（既定）</option>
+                                    <option value="1">デバイス1</option>
+                                  </select>
+                                </label>
+                              )}
+                              <label className="field">
+                                <span>モデル</span>
+                                <select
+                                  value={selectedModel}
+                                  onChange={(e) => setSelectedModel(e.target.value)}
+                                >
+                                  {modelOptions.length === 0 ? (
+                                    <option value="">読み込み中</option>
+                                  ) : (
+                                    modelOptions.map((name) => (
+                                      <option key={name} value={name}>{name}</option>
+                                    ))
+                                  )}
+                                </select>
+                              </label>
+                              <div className="camera-card-actions">
+                                <button
+                                  className="secondary"
+                                  type="button"
+                                  onClick={() => deleteCameraProfile(profile.id)}
+                                >
+                                  設定を削除
+                                </button>
+                              </div>
+                              {(connectionState !== 'idle' || connectionMessage) && (
+                                <p className={`muted connection-line state-${connectionState}`}>
+                                  状態: {connectionState}
+                                  {connectionMessage ? ` / ${connectionMessage}` : ''}
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </aside>
+              <div className={`preview${isCameraSidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+              <div className="stream-column">
+                <div className="video-shell">
+                  <div
+                    className={`stream-frame${showVideoSettings ? ' is-adjusting' : ' is-raw'}`}
+                    ref={streamRef}
+                  >
+                    {showVideoSettings && (
+                      <div className="stream-adjusting-indicator">映像調整中</div>
+                    )}
+                    <div className="stream-metrics-overlay">
+                      FPS: {displayFps > 0 ? displayFps.toFixed(1) : '-'} Zoom: {displayZoomPct}%
                     </div>
-                  )}
-                  <div className="region-layer">
-                    {regions.map((region) => (
-                      <div
-                        key={region.id}
-                        className="region-box"
-                        style={{
-                          left: `${region.x}px`,
-                          top: `${region.y}px`,
-                          width: `${region.w}px`,
-                          height: `${region.h}px`,
-                          '--region-color': region.color || '#ff3b3b',
+                    <canvas
+                      ref={streamCanvasRef}
+                      className="stream-canvas"
+                      onClick={handleStreamClick}
+                    />
+                    {imageData ? (
+                      <img
+                        ref={sourceImageRef}
+                        src={imageData}
+                        alt="Live Stream"
+                        className={`stream-source${showVideoSettings ? ' is-hidden' : ' is-visible'}`}
+                        onLoad={() => {
+                          imageVersionRef.current += 1;
+                          setSourceSize({
+                            width: sourceImageRef.current?.naturalWidth || 0,
+                            height: sourceImageRef.current?.naturalHeight || 0,
+                          });
+                          computeMediaRect();
                         }}
-                        onMouseDown={(event) => {
-                          event.preventDefault();
-                          const rect = streamRef.current.getBoundingClientRect();
-                          if (rect.width === 0 || rect.height === 0) return;
-                          const rawX = event.clientX - rect.left;
-                          const rawY = event.clientY - rect.top;
-                          if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
-                          const pointerX = clamp(rawX, 0, rect.width);
-                          const pointerY = clamp(rawY, 0, rect.height);
-                          const offsetX = clamp(pointerX - region.x, 0, region.w);
-                          const offsetY = clamp(pointerY - region.y, 0, region.h);
-                          dragRef.current = {
-                            id: region.id,
-                            type: 'move',
-                            lastX: pointerX,
-                            lastY: pointerY,
-                            offsetX,
-                            offsetY,
-                          };
-                          setActiveAction({ id: region.id, type: 'move' });
+                      />
+                    ) : (
+                      <div className="stream-frame-placeholder">
+                        映像受信待ち...
+                      </div>
+                    )}
+                    {!hideRoiRegions && (
+                      <div
+                        className="region-layer"
+                        ref={regionLayerRef}
+                        style={{
+                          left: `${mediaRect.x}px`,
+                          top: `${mediaRect.y}px`,
+                          width: `${mediaRect.width}px`,
+                          height: `${mediaRect.height}px`,
                         }}
                       >
-                        <span
-                          className={`region-label${region.y < 12 ? ' label-bottom' : ''}${region.x < 12 ? ' label-right' : ''}`}
-                        >
-                          {region.name}
-                        </span>
-                        <span
-                          className="region-handle"
-                          onMouseDown={(event) => {
-                            event.stopPropagation();
-                            const rect = streamRef.current.getBoundingClientRect();
-                            if (rect.width === 0 || rect.height === 0) return;
-                            const rawX = event.clientX - rect.left;
-                            const rawY = event.clientY - rect.top;
-                            if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
-                            const pointerX = clamp(rawX, 0, rect.width);
-                            const pointerY = clamp(rawY, 0, rect.height);
-                            dragRef.current = {
-                              id: region.id,
-                              type: 'resize',
-                              lastX: pointerX,
-                              lastY: pointerY,
-                            };
-                            setActiveAction({ id: region.id, type: 'resize' });
-                          }}
-                        />
+                        {regions.map((region) => (
+                          <div
+                            key={region.id}
+                            className="region-box"
+                            style={{
+                              left: `${region.x}px`,
+                              top: `${region.y}px`,
+                              width: `${region.w}px`,
+                              height: `${region.h}px`,
+                              '--region-color': region.color || '#ff3b3b',
+                            }}
+                            onMouseDown={(event) => {
+                              event.preventDefault();
+                              const rect = getInteractionRect();
+                              if (!rect) return;
+                              const rawX = event.clientX - rect.left;
+                              const rawY = event.clientY - rect.top;
+                              if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+                              const pointerX = clamp(rawX, 0, rect.width);
+                              const pointerY = clamp(rawY, 0, rect.height);
+                              const offsetX = clamp(pointerX - region.x, 0, region.w);
+                              const offsetY = clamp(pointerY - region.y, 0, region.h);
+                              dragRef.current = {
+                                id: region.id,
+                                type: 'move',
+                                lastX: pointerX,
+                                lastY: pointerY,
+                                offsetX,
+                                offsetY,
+                              };
+                              setActiveAction({ id: region.id, type: 'move' });
+                            }}
+                          >
+                            <span
+                              className={`region-label${region.y < 12 ? ' label-bottom' : ''}${region.x < 12 ? ' label-right' : ''}`}
+                            >
+                              {region.name}
+                            </span>
+                            <span
+                              className="region-handle"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                const rect = getInteractionRect();
+                                if (!rect) return;
+                                const rawX = event.clientX - rect.left;
+                                const rawY = event.clientY - rect.top;
+                                if (!isFiniteNumber(rawX) || !isFiniteNumber(rawY)) return;
+                                const pointerX = clamp(rawX, 0, rect.width);
+                                const pointerY = clamp(rawY, 0, rect.height);
+                                dragRef.current = {
+                                  id: region.id,
+                                  type: 'resize',
+                                  lastX: pointerX,
+                                  lastY: pointerY,
+                                };
+                                setActiveAction({ id: region.id, type: 'resize' });
+                              }}
+                            />
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
+                  </div>
+                </div>
+                <div className="left-bottom">
+                  <div className="stream-header">
+                    <h3>{activeCameraName}</h3>
+                    <div className="stream-actions">
+                      <button className="ghost" type="button" onClick={addRegion}>
+                        領域作成 +
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
-              <div className="side-column">
+              <div className="right-pane">
                 <aside className="results">
-                  <h4>推論結果</h4>
-                  <div className="result-card">
-                    <div className="result-label">現在値</div>
-                    <div className="result-value">
-                      {inferResult ? String(inferResult.finalValue) : '-'}
-                    </div>
-                    <div className="result-grid">
-                      <div>
-                        <div className="result-label">Confidence</div>
-                        <div>{inferResult ? String(inferResult.finalConfidence) : '-'}</div>
-                      </div>
-                      <div>
-                        <div className="result-label">更新時刻</div>
-                        <div>{inferResult ? formatReadingTimestamp(inferResult.ts) : '-'}</div>
-                      </div>
-                    </div>
-                    {inferResult && (
-                      <p className="muted result-raw">
-                        raw: [{inferResult.rawValues.join(', ')}] / 採用: {inferResult.adoptedAttempt}回目（{inferResult.strategy}）
-                      </p>
-                    )}
-                  </div>
-                  <h4>領域結果</h4>
-                  {regions.length === 0 ? (
-                    <p className="muted">領域を作成すると結果が表示されます。</p>
-                  ) : (
-                    <ul>
-                      {regions.map((region) => (
-                        <li
-                          key={region.id}
-                          className={`result-item${dragOverId === `${region.id}:before` ? ' is-drop-before' : ''}${dragOverId === `${region.id}:after` ? ' is-drop-after' : ''}`}
-                          draggable
-                          onDragStart={(event) => {
-                            event.dataTransfer.effectAllowed = 'move';
-                            event.dataTransfer.setData('text/plain', region.id);
-                          }}
-                          onDragOver={(event) => {
-                            event.preventDefault();
-                            event.dataTransfer.dropEffect = 'move';
-                            const rect = event.currentTarget.getBoundingClientRect();
-                            const isAfter = event.clientY > rect.top + rect.height / 2;
-                            const nextId = `${region.id}:${isAfter ? 'after' : 'before'}`;
-                            if (dragOverId !== nextId) {
-                              setDragOverId(nextId);
-                            }
-                          }}
-                          onDrop={(event) => {
-                            event.preventDefault();
-                            const fromId = event.dataTransfer.getData('text/plain');
-                            const dropTarget = dragOverId || `${region.id}:after`;
-                            const [targetId, position] = dropTarget.split(':');
-                            if (!targetId) {
-                              reorderRegions(fromId, region.id);
-                              return;
-                            }
-                            setRegions((prev) => {
-                              const fromIndex = prev.findIndex((item) => item.id === fromId);
-                              const targetIndex = prev.findIndex((item) => item.id === targetId);
-                              if (fromIndex === -1 || targetIndex === -1) return prev;
-                              const next = [...prev];
-                              const [moved] = next.splice(fromIndex, 1);
-                              const insertIndex = position === 'before' ? targetIndex : targetIndex + 1;
-                              next.splice(insertIndex, 0, moved);
-                              return next;
-                            });
-                            setDragOverId(null);
-                          }}
-                          onDragLeave={() => setDragOverId(null)}
-                        >
-                          <div className="result-row">
-                            <input
-                              className="result-name-input"
-                              type="text"
-                              value={region.name}
-                              onChange={(event) => updateRegionName(region.id, event.target.value)}
-                            />
-                            <input
-                              className="result-color-input"
-                              type="color"
-                              value={region.color || '#ff3b3b'}
-                              onChange={(event) => updateRegionColor(region.id, event.target.value)}
-                              aria-label={`${region.name}の色を変更`}
-                            />
-                            <button
-                              className="icon-button"
-                              type="button"
-                              onClick={() => removeRegion(region.id)}
-                              aria-label={`${region.name}を削除`}
+                  <details className="results-section" open>
+                    <summary>領域結果</summary>
+                    {regions.length === 0 ? (
+                      <p className="muted">領域を作成すると結果が表示されます。</p>
+                    ) : (
+                      <ul>
+                        {regions.map((region) => (
+                            <li
+                              key={region.id}
+                              className={`result-item${dragOverId === `${region.id}:before` ? ' is-drop-before' : ''}${dragOverId === `${region.id}:after` ? ' is-drop-after' : ''}`}
+                              draggable
+                              onDragStart={(event) => {
+                                event.dataTransfer.effectAllowed = 'move';
+                                event.dataTransfer.setData('text/plain', region.id);
+                              }}
+                              onDragOver={(event) => {
+                                event.preventDefault();
+                                event.dataTransfer.dropEffect = 'move';
+                                const rect = event.currentTarget.getBoundingClientRect();
+                                const isAfter = event.clientY > rect.top + rect.height / 2;
+                                const nextId = `${region.id}:${isAfter ? 'after' : 'before'}`;
+                                if (dragOverId !== nextId) {
+                                  setDragOverId(nextId);
+                                }
+                              }}
+                              onDrop={(event) => {
+                                event.preventDefault();
+                                const fromId = event.dataTransfer.getData('text/plain');
+                                const dropTarget = dragOverId || `${region.id}:after`;
+                                const [targetId, position] = dropTarget.split(':');
+                                if (!targetId) {
+                                  reorderRegions(fromId, region.id);
+                                  return;
+                                }
+                                setRegions((prev) => {
+                                  const fromIndex = prev.findIndex((item) => item.id === fromId);
+                                  const targetIndex = prev.findIndex((item) => item.id === targetId);
+                                  if (fromIndex === -1 || targetIndex === -1) return prev;
+                                  const next = [...prev];
+                                  const [moved] = next.splice(fromIndex, 1);
+                                  const insertIndex = position === 'before' ? targetIndex : targetIndex + 1;
+                                  next.splice(insertIndex, 0, moved);
+                                  return next;
+                                });
+                                setDragOverId(null);
+                              }}
+                              onDragLeave={() => setDragOverId(null)}
                             >
-                              −
-                            </button>
-                          </div>
-                          <div className="region-value">
-                            <span className="result-count">
-                              {regionValues[region.id] ?? ''}
-                            </span>
-                            {/*
-                            <span className="result-meta">
-                              x:{Math.round(region.x)} y:{Math.round(region.y)}
-                              w:{Math.round(region.w)} h:{Math.round(region.h)}
-                            </span>
-                            */}
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
+                              <div className="result-row">
+                                <input
+                                  className="result-name-input"
+                                  type="text"
+                                  value={region.name}
+                                  onChange={(event) => updateRegionName(region.id, event.target.value)}
+                                />
+                                <input
+                                  className="result-color-input"
+                                  type="color"
+                                  value={region.color || '#ff3b3b'}
+                                  onChange={(event) => updateRegionColor(region.id, event.target.value)}
+                                  aria-label={`${region.name}の色を変更`}
+                                />
+                                <button
+                                  className="icon-button"
+                                  type="button"
+                                  onClick={() => removeRegion(region.id)}
+                                  aria-label={`${region.name}を削除`}
+                                >
+                                  −
+                                </button>
+                              </div>
+                              <div className="region-value">
+                                <span className="result-count">
+                                  {regionValues[region.id] ?? ''}
+                                </span>
+                                {/*
+                                <span className="result-meta">
+                                  x:{Math.round(region.x)} y:{Math.round(region.y)}
+                                  w:{Math.round(region.w)} h:{Math.round(region.h)}
+                                </span>
+                                */}
+                              </div>
+                            </li>
+                        ))}
+                      </ul>
+                    )}
+                  </details>
                 </aside>
+              </div>
+              </div>
+            </div>
+        </section>
+        <section
+          className={`tab-panel dashboard-view${activeTab === 'dashboard' ? ' is-active' : ' is-hidden'}`}
+          aria-hidden={activeTab !== 'dashboard'}
+        >
+          <div className="dashboard-tab-row">
+            <div className="tab-row">
+              <button
+                type="button"
+                className={`tab-button ${activeTab === 'stream' ? 'active' : ''}`}
+                onClick={() => setActiveTab('stream')}
+              >
+                Stream
+              </button>
+              <button
+                type="button"
+                className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`}
+                onClick={() => setActiveTab('dashboard')}
+              >
+                Dashboard
+              </button>
+              <button
+                type="button"
+                className={`tab-button ${showSettingsDialog ? 'active' : ''}`}
+                onClick={() => {
+                  setActiveSettingsTab('yolo');
+                  setShowSettingsDialog(true);
+                }}
+              >
+                Setting
+              </button>
+            </div>
+          </div>
+          <DashboardPage />
+        </section>
+        {showSettingsDialog && (
+          <div
+            className="settings-dialog-backdrop"
+            onClick={() => setShowSettingsDialog(false)}
+          >
+            <section
+              ref={settingsDialogRef}
+              className={`settings-dialog${isSettingsDialogDragging ? ' dragging' : ''}`}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Setting"
+              style={{
+                left: `${settingsDialogPosition.left}px`,
+                top: `${settingsDialogPosition.top}px`,
+              }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div
+                className="settings-dialog-header"
+                onMouseDown={(event) => {
+                  if (event.button !== 0) return;
+                  if (event.target.closest('button')) return;
+                  const rect = settingsDialogRef.current?.getBoundingClientRect();
+                  if (!rect) return;
+                  event.preventDefault();
+                  settingsDialogDragRef.current = {
+                    offsetX: event.clientX - rect.left,
+                    offsetY: event.clientY - rect.top,
+                  };
+                  setIsSettingsDialogDragging(true);
+                }}
+              >
+                <h3>Setting</h3>
                 <button
-                  className="primary infer-button"
+                  className="secondary"
                   type="button"
-                  onClick={runInferenceWithCurrentFrame}
-                  disabled={inferLoading || !imageData}
+                  onClick={() => setShowSettingsDialog(false)}
                 >
-                  {inferLoading ? '推論中...' : '現在フレームで推論'}
+                  Close
                 </button>
-                {inferError && <p className="muted">{inferError}</p>}
+              </div>
+              <div className="settings-dialog-tabs">
                 <button
-                  className="secondary settings-toggle"
                   type="button"
-                  onClick={() => setShowVideoSettings((prev) => !prev)}
+                  className={`settings-tab ${activeSettingsTab === 'yolo' ? 'active' : ''}`}
+                  onClick={() => setActiveSettingsTab('yolo')}
                 >
-                  {showVideoSettings ? '▲ 映像調整' : '▼ 映像調整'}
+                  YOLO
                 </button>
-                {showVideoSettings && (
+                <button
+                  type="button"
+                  className={`settings-tab ${activeSettingsTab === 'image' ? 'active' : ''}`}
+                  onClick={() => setActiveSettingsTab('image')}
+                >
+                  Image
+                </button>
+                <button
+                  type="button"
+                  className={`settings-tab ${activeSettingsTab === 'test' ? 'active' : ''}`}
+                  onClick={() => setActiveSettingsTab('test')}
+                >
+                  Test
+                </button>
+              </div>
+              <div className="settings-dialog-body">
+                {activeSettingsTab === 'yolo' && (
+                  <div className="settings-tab-panel">
+                    <h4>YOLO検出設定</h4>
+                    <div className="setting-details-body">
+                      <label className="setting-row setting-row--stacked">
+                        <span>検出確信度（閾値）</span>
+                        <input
+                          type="range"
+                          min="0.01"
+                          max="0.99"
+                          step="0.01"
+                          value={detectionSettings.confidenceThreshold}
+                          onChange={(event) => updateDetectionSetting('confidenceThreshold', Number(event.target.value))}
+                        />
+                        <strong className="setting-value">{detectionSettings.confidenceThreshold.toFixed(2)}</strong>
+                      </label>
+                      <label className="setting-row setting-row--stacked">
+                        <span>検出頻度（何フレームごとに結果更新するか）</span>
+                        <input
+                          type="range"
+                          min="1"
+                          max="20"
+                          step="1"
+                          value={detectionSettings.resultIntervalFrames}
+                          onChange={(event) => updateDetectionSetting('resultIntervalFrames', Number(event.target.value))}
+                        />
+                        <strong className="setting-value">{Math.round(detectionSettings.resultIntervalFrames)}f</strong>
+                      </label>
+                      <label className="setting-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={detectionSettings.mergeSameDigits}
+                          onChange={(event) => updateDetectionSetting('mergeSameDigits', event.target.checked)}
+                        />
+                        <span>同一文字の近接マージを有効化（例: 000→0 の抑制）</span>
+                      </label>
+                      <label className="setting-row setting-row--stacked">
+                        <span>同一文字マージ: 行方向許容</span>
+                        <input
+                          type="range"
+                          min="0.05"
+                          max="2.0"
+                          step="0.05"
+                          value={detectionSettings.mergeSameDigitsRowTolerance}
+                          onChange={(event) => updateDetectionSetting('mergeSameDigitsRowTolerance', Number(event.target.value))}
+                          disabled={!detectionSettings.mergeSameDigits}
+                        />
+                        <strong className="setting-value">{detectionSettings.mergeSameDigitsRowTolerance.toFixed(2)}</strong>
+                      </label>
+                      <label className="setting-row setting-row--stacked">
+                        <span>同一文字マージ: 横方向近接</span>
+                        <input
+                          type="range"
+                          min="0.01"
+                          max="2.0"
+                          step="0.01"
+                          value={detectionSettings.mergeSameDigitsXGapRatio}
+                          onChange={(event) => updateDetectionSetting('mergeSameDigitsXGapRatio', Number(event.target.value))}
+                          disabled={!detectionSettings.mergeSameDigits}
+                        />
+                        <strong className="setting-value">{detectionSettings.mergeSameDigitsXGapRatio.toFixed(2)}</strong>
+                      </label>
+                    </div>
+                  </div>
+                )}
+                {activeSettingsTab === 'image' && (
                   <aside className="video-settings">
                     <div className="video-settings-header">
-                      <h4>映像の調整設定</h4>
+                      <h4>映像調整</h4>
                       <button className="secondary" type="button" onClick={resetVideoSettings}>
                         Reset
                       </button>
                     </div>
-                    <label className="setting-row">
-                      <span>明るさ</span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="3"
-                        step="0.05"
-                        value={videoSettings.brightness}
-                        onChange={(event) => updateVideoSetting('brightness', Number(event.target.value))}
-                      />
-                      <strong className="setting-value">{videoSettings.brightness.toFixed(2)}</strong>
-                    </label>
-                    <label className="setting-row">
-                      <span>コントラスト</span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="3"
-                        step="0.05"
-                        value={videoSettings.contrast}
-                        onChange={(event) => updateVideoSetting('contrast', Number(event.target.value))}
-                      />
-                      <strong className="setting-value">{videoSettings.contrast.toFixed(2)}</strong>
-                    </label>
-                    <label className="setting-row">
-                      <span>ガンマ</span>
-                      <input
-                        type="range"
-                        min="0.05"
-                        max="4"
-                        step="0.05"
-                        value={videoSettings.gamma}
-                        onChange={(event) => updateVideoSetting('gamma', Number(event.target.value))}
-                      />
-                      <strong className="setting-value">{videoSettings.gamma.toFixed(2)}</strong>
-                    </label>
-                    <label className="setting-row">
-                      <span>シャープネス</span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="3"
-                        step="0.05"
-                        value={videoSettings.sharpness}
-                        onChange={(event) => updateVideoSetting('sharpness', Number(event.target.value))}
-                      />
-                      <strong className="setting-value">{videoSettings.sharpness.toFixed(2)}</strong>
-                    </label>
-                    <label className="setting-row">
-                      <span>白飛び抑制</span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.05"
-                        value={videoSettings.highlightSuppression}
-                        onChange={(event) => updateVideoSetting('highlightSuppression', Number(event.target.value))}
-                      />
-                      <strong className="setting-value">{videoSettings.highlightSuppression.toFixed(2)}</strong>
-                    </label>
-                    <label className="setting-row">
-                      <span>白飛び推定復元</span>
-                      <input
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.05"
-                        value={videoSettings.highlightRecovery}
-                        onChange={(event) => updateVideoSetting('highlightRecovery', Number(event.target.value))}
-                      />
-                      <strong className="setting-value">{videoSettings.highlightRecovery.toFixed(2)}</strong>
-                    </label>
-                    <div className="setting-section">
-                      <label className="setting-checkbox">
-                        <input
-                          type="checkbox"
-                          checked={videoSettings.claheEnabled}
-                          onChange={(event) => updateVideoSetting('claheEnabled', event.target.checked)}
-                        />
-                        <span>CLAHEを有効化</span>
-                      </label>
-                      <label className="setting-row">
-                        <span>clipLimit</span>
-                        <input
-                          type="range"
-                          min="1"
-                          max="12"
-                          step="1"
-                          value={videoSettings.claheClipLimit}
-                          onChange={(event) => updateVideoSetting('claheClipLimit', Number(event.target.value))}
-                        />
-                        <strong className="setting-value">{videoSettings.claheClipLimit.toFixed(0)}</strong>
-                      </label>
-                      <label className="setting-row">
-                        <span>tileGridSize</span>
-                        <input
-                          type="range"
-                          min="4"
-                          max="24"
-                          step="1"
-                          value={videoSettings.claheTileGridSize}
-                          onChange={(event) => updateVideoSetting('claheTileGridSize', Number(event.target.value))}
-                        />
-                        <strong className="setting-value">{videoSettings.claheTileGridSize.toFixed(0)}</strong>
-                      </label>
-                    </div>
-                    <div className="setting-section">
-                      <p className="setting-title">フォーカス（ズーム＋中心）</p>
-                      <label className="setting-row">
-                        <span>zoom</span>
-                        <input
-                          type="range"
-                          min="1"
-                          max="6"
-                          step="0.05"
-                          value={videoSettings.zoom}
-                          onChange={(event) => updateVideoSetting('zoom', Number(event.target.value))}
-                        />
-                        <strong className="setting-value">{videoSettings.zoom.toFixed(2)}</strong>
-                      </label>
-                      <label className="setting-row">
-                        <span>centerX</span>
-                        <input
-                          type="range"
-                          min="0"
-                          max="1"
-                          step="0.01"
-                          value={videoSettings.centerX}
-                          onChange={(event) => updateVideoSetting('centerX', Number(event.target.value))}
-                        />
-                        <strong className="setting-value">{videoSettings.centerX.toFixed(2)}</strong>
-                      </label>
-                      <label className="setting-row">
-                        <span>centerY</span>
-                        <input
-                          type="range"
-                          min="0"
-                          max="1"
-                          step="0.01"
-                          value={videoSettings.centerY}
-                          onChange={(event) => updateVideoSetting('centerY', Number(event.target.value))}
-                        />
-                        <strong className="setting-value">{videoSettings.centerY.toFixed(2)}</strong>
-                      </label>
-                      <p className="muted">映像をクリックすると中心位置を更新できます。</p>
+                    <div className="video-settings-body">
+                      <div className="setting-section">
+                        <label className="setting-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={showVideoSettings}
+                            onChange={(event) => setShowVideoSettings(event.target.checked)}
+                          />
+                          <span>映像調整プレビューを有効化</span>
+                        </label>
+                        <label className="setting-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={hideRoiRegions}
+                            onChange={(event) => setHideRoiRegions(event.target.checked)}
+                          />
+                          <span>ROI領域を非表示</span>
+                        </label>
+                        <label className="setting-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={hideInferenceResults}
+                            onChange={(event) => setHideInferenceResults(event.target.checked)}
+                          />
+                          <span>推論結果を非表示（映像内）</span>
+                        </label>
+                      </div>
+                      <div className="setting-section">
+                        <p className="setting-title">基本補正</p>
+                        <label className="setting-row">
+                          <span>明るさ</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="3"
+                            step="0.05"
+                            value={videoSettings.brightness}
+                            onChange={(event) => updateVideoSetting('brightness', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.brightness.toFixed(2)}</strong>
+                        </label>
+                        <label className="setting-row">
+                          <span>コントラスト</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="3"
+                            step="0.05"
+                            value={videoSettings.contrast}
+                            onChange={(event) => updateVideoSetting('contrast', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.contrast.toFixed(2)}</strong>
+                        </label>
+                        <label className="setting-row">
+                          <span>ガンマ</span>
+                          <input
+                            type="range"
+                            min="0.05"
+                            max="4"
+                            step="0.05"
+                            value={videoSettings.gamma}
+                            onChange={(event) => updateVideoSetting('gamma', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.gamma.toFixed(2)}</strong>
+                        </label>
+                        <label className="setting-row">
+                          <span>シャープネス</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="3"
+                            step="0.05"
+                            value={videoSettings.sharpness}
+                            onChange={(event) => updateVideoSetting('sharpness', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.sharpness.toFixed(2)}</strong>
+                        </label>
+                      </div>
+                      <details className="setting-details" open>
+                        <summary>白飛び補正</summary>
+                        <div className="setting-details-body">
+                          <label className="setting-row setting-row--stacked">
+                            <span>白飛び抑制(白飛びを抑える)</span>
+                            <input
+                              type="range"
+                              min="0"
+                              max="1"
+                              step="0.05"
+                              value={videoSettings.highlightSuppression}
+                              onChange={(event) => updateVideoSetting('highlightSuppression', Number(event.target.value))}
+                            />
+                            <strong className="setting-value">{videoSettings.highlightSuppression.toFixed(2)}</strong>
+                          </label>
+                          <p className="setting-title">復元</p>
+                          <label className="setting-row setting-row--stacked">
+                            <span>復元方式</span>
+                            <select
+                              value={videoSettings.highlightRecoveryMode}
+                              onChange={(event) => updateVideoSetting('highlightRecoveryMode', event.target.value)}
+                            >
+                              <option value="natural">自然光復元</option>
+                              <option value="line">線状白飛び復元</option>
+                            </select>
+                          </label>
+                          <label className="setting-row setting-row--stacked">
+                            <span>復元強度</span>
+                            <input
+                              type="range"
+                              min="0"
+                              max="1"
+                              step="0.05"
+                              value={videoSettings.highlightRecovery}
+                              onChange={(event) => updateVideoSetting('highlightRecovery', Number(event.target.value))}
+                            />
+                            <strong className="setting-value">{videoSettings.highlightRecovery.toFixed(2)}</strong>
+                          </label>
+                          <label className="setting-row setting-row--stacked">
+                            <span>復元カーブ(復元の効き方)</span>
+                            <input
+                              type="range"
+                              min="0.5"
+                              max="3"
+                              step="0.05"
+                              value={videoSettings.highlightRecoveryCurve}
+                              onChange={(event) => updateVideoSetting('highlightRecoveryCurve', Number(event.target.value))}
+                            />
+                            <strong className="setting-value">{videoSettings.highlightRecoveryCurve.toFixed(2)}</strong>
+                          </label>
+                          {videoSettings.highlightRecoveryMode === 'line' && (
+                            <>
+                              <p className="setting-title">線状白飛び詳細</p>
+                              <label className="setting-row setting-row--stacked">
+                                <span>線状復元探索距離(px)</span>
+                                <input
+                                  type="range"
+                                  min="3"
+                                  max="20"
+                                  step="1"
+                                  value={videoSettings.highlightLineMaxDist}
+                                  onChange={(event) => updateVideoSetting('highlightLineMaxDist', Number(event.target.value))}
+                                />
+                                <strong className="setting-value">{videoSettings.highlightLineMaxDist.toFixed(0)}</strong>
+                              </label>
+                              <label className="setting-row setting-row--stacked">
+                                <span>横連結距離(px)</span>
+                                <input
+                                  type="range"
+                                  min="3"
+                                  max="25"
+                                  step="1"
+                                  value={videoSettings.highlightLineKernelWidth}
+                                  onChange={(event) => updateVideoSetting('highlightLineKernelWidth', Number(event.target.value))}
+                                />
+                                <strong className="setting-value">{videoSettings.highlightLineKernelWidth.toFixed(0)}</strong>
+                              </label>
+                            </>
+                          )}
+                        </div>
+                      </details>
+                      <div className="setting-section">
+                        <label className="setting-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={videoSettings.binarizationEnabled}
+                            onChange={(event) => updateVideoSetting('binarizationEnabled', event.target.checked)}
+                          />
+                          <span>2値化を有効化</span>
+                        </label>
+                        <label className="setting-row">
+                          <span>threshold</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="255"
+                            step="1"
+                            value={videoSettings.binarizationThreshold}
+                            onChange={(event) => updateVideoSetting('binarizationThreshold', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.binarizationThreshold.toFixed(0)}</strong>
+                        </label>
+                      </div>
+                      <div className="setting-section">
+                        <label className="setting-checkbox">
+                          <input
+                            type="checkbox"
+                            checked={videoSettings.claheEnabled}
+                            onChange={(event) => updateVideoSetting('claheEnabled', event.target.checked)}
+                          />
+                          <span>CLAHEを有効化</span>
+                        </label>
+                        <label className="setting-row">
+                          <span>clipLimit</span>
+                          <input
+                            type="range"
+                            min="1"
+                            max="12"
+                            step="1"
+                            value={videoSettings.claheClipLimit}
+                            onChange={(event) => updateVideoSetting('claheClipLimit', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.claheClipLimit.toFixed(0)}</strong>
+                        </label>
+                        <label className="setting-row">
+                          <span>tileGridSize</span>
+                          <input
+                            type="range"
+                            min="4"
+                            max="24"
+                            step="1"
+                            value={videoSettings.claheTileGridSize}
+                            onChange={(event) => updateVideoSetting('claheTileGridSize', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.claheTileGridSize.toFixed(0)}</strong>
+                        </label>
+                      </div>
+                      <div className="setting-section">
+                        <p className="setting-title">フォーカス（ズーム＋中心）</p>
+                        <label className="setting-row">
+                          <span>zoom</span>
+                          <input
+                            type="range"
+                            min="1"
+                            max="6"
+                            step="0.05"
+                            value={videoSettings.zoom}
+                            onChange={(event) => updateVideoSetting('zoom', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.zoom.toFixed(2)}</strong>
+                        </label>
+                        <label className="setting-row">
+                          <span>centerX</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            value={videoSettings.centerX}
+                            onChange={(event) => updateVideoSetting('centerX', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.centerX.toFixed(2)}</strong>
+                        </label>
+                        <label className="setting-row">
+                          <span>centerY</span>
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            value={videoSettings.centerY}
+                            onChange={(event) => updateVideoSetting('centerY', Number(event.target.value))}
+                          />
+                          <strong className="setting-value">{videoSettings.centerY.toFixed(2)}</strong>
+                        </label>
+                        <p className="muted">映像をクリックすると中心位置を更新できます。</p>
+                      </div>
                     </div>
                   </aside>
                 )}
+                {activeSettingsTab === 'test' && (
+                  <div className="settings-tab-panel">
+                    <h4>テストモード（学習用画像撮影）</h4>
+                    <div className="setting-details-body">
+                      <p className="muted">
+                        表示中の映像を inbo ディレクトリへ <code>yyyymmddhhmmss.png</code> 形式で保存します。
+                      </p>
+                      <label className="field">
+                        <span>保存先（inbo配下）</span>
+                        <input
+                          type="text"
+                          value={testCaptureSaveDir}
+                          list="test-capture-dir-options"
+                          onChange={(event) => {
+                            setTestCaptureSaveDir(event.target.value);
+                            if (testCaptureSaveDirAbs) setTestCaptureSaveDirAbs('');
+                          }}
+                          placeholder="空欄で inbo 直下 / 例: train/cam01"
+                        />
+                        <datalist id="test-capture-dir-options">
+                          <option value="" />
+                          <option value="train" />
+                          <option value="train/cam01" />
+                          <option value="valid" />
+                        </datalist>
+                      </label>
+                      <div className="camera-settings-actions">
+                        <button
+                          className="secondary"
+                          type="button"
+                          onClick={pickTestModeSaveDir}
+                          disabled={testCaptureSelectingDir}
+                        >
+                          {testCaptureSelectingDir ? '参照中...' : 'ローカル参照...'}
+                        </button>
+                        {testCaptureSaveDirAbs && (
+                          <button
+                            className="ghost"
+                            type="button"
+                            onClick={() => setTestCaptureSaveDirAbs('')}
+                          >
+                            絶対パス指定を解除
+                          </button>
+                        )}
+                      </div>
+                      <p className="muted">
+                        現在の保存先:
+                        {' '}
+                        <code>
+                          {testCaptureSaveDirAbs.trim()
+                            ? testCaptureSaveDirAbs.trim()
+                            : `backend/data/inbo${testCaptureSaveDir.trim() ? `/${testCaptureSaveDir.trim()}` : ''}`}
+                        </code>
+                      </p>
+                      <button
+                        className="secondary"
+                        type="button"
+                        onClick={saveTestModeCapture}
+                        disabled={testCaptureSaving || !imageData}
+                      >
+                        {testCaptureSaving ? '保存中...' : '現在フレームを保存'}
+                      </button>
+                      {testCaptureMessage && (
+                        <p className="muted test-capture-message">{testCaptureMessage}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
-        </>
-      )}
+            </section>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

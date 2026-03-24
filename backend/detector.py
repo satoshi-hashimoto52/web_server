@@ -107,7 +107,13 @@ def get_model(model_name=None):
     return _model_cache[filename]
 
 
-def detect_objects(frame, model_name=None):
+def detect_objects(
+    frame,
+    model_name=None,
+    draw_overlay=True,
+    draw_model_label=True,
+    conf_threshold: float = 0.25,
+):
     """
     フレームに対して YOLOv8 で物体検出を行い、
     バウンディングボックスとラベルを描画して返します。
@@ -115,7 +121,7 @@ def detect_objects(frame, model_name=None):
     active_model_name = model_name or MODEL_FILENAME
     model = get_model(active_model_name)
     # 推論
-    results = model(frame, device=device)[0]  # device を明示
+    results = model(frame, device=device, conf=float(max(0.0, min(conf_threshold, 1.0))))[0]  # device を明示
     boxes = results.boxes
     detections = []
 
@@ -137,20 +143,22 @@ def detect_objects(frame, model_name=None):
     # 重なりが大きい検出は確信度の高い方のみ残す
     detections = _nms(detections, iou_threshold=0.75)
 
-    for det in detections:
-        x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
-        label = f"{model.names[det['cls_id']]} {det['conf']:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    if draw_overlay:
+        for det in detections:
+            x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+            label = f"{model.names[det['cls_id']]} {det['conf']:.2f}"
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     # 左上に現在の推論モデル名を表示（黒縁の緑文字）
-    model_label = f"Model: {active_model_name}"
-    text_org = (12, 34)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.9
-    # 先に太めの黒で描画して縁取りを作る
-    cv2.putText(frame, model_label, text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
-    # 上に緑文字を重ねる
-    cv2.putText(frame, model_label, text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
+    if draw_model_label:
+        model_label = f"Model: {active_model_name}"
+        text_org = (12, 34)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        # 先に太めの黒で描画して縁取りを作る
+        cv2.putText(frame, model_label, text_org, font, font_scale, (0, 0, 0), 5, cv2.LINE_AA)
+        # 上に緑文字を重ねる
+        cv2.putText(frame, model_label, text_org, font, font_scale, (0, 255, 0), 2, cv2.LINE_AA)
     return frame, detections
