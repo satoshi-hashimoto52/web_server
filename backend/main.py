@@ -9,7 +9,9 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import subprocess
+import threading
 import time
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -64,6 +66,7 @@ DEFAULT_RESULT_INTERVAL_FRAMES = 1
 DEFAULT_MERGE_SAME_DIGITS = True
 DEFAULT_MERGE_ROW_TOLERANCE = 0.5
 DEFAULT_MERGE_X_GAP_RATIO = 0.35
+FRONTEND_DEV_PORTS = os.getenv("FRONTEND_DEV_PORTS", "5173,4173")
 
 
 @app.on_event("startup")
@@ -336,6 +339,98 @@ def _resolve_test_mode_save_dir(save_dir: Optional[str], save_dir_abs: Optional[
     return target_dir
 
 
+def _read_process_command(pid: int) -> str:
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+        return (proc.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _collect_frontend_dev_pids() -> list[int]:
+    candidates = []
+    for raw in FRONTEND_DEV_PORTS.split(","):
+        port_text = raw.strip()
+        if not port_text.isdigit():
+            continue
+        candidates.append(int(port_text))
+
+    detected = set()
+    current_pid = os.getpid()
+    for port in candidates:
+        try:
+            proc = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+        except Exception:
+            continue
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line or not line.isdigit():
+                continue
+            pid = int(line)
+            if pid <= 1 or pid == current_pid:
+                continue
+            command = _read_process_command(pid).lower()
+            if "vite" in command or "npm run dev" in command or ("node" in command and "frontend" in command):
+                detected.add(pid)
+    return sorted(detected)
+
+
+def _collect_backend_shutdown_pids() -> list[int]:
+    current_pid = os.getpid()
+    parent_pid = os.getppid()
+    targets = {current_pid}
+    if parent_pid > 1:
+        parent_command = _read_process_command(parent_pid).lower()
+        if "uvicorn" in parent_command or "watchfiles" in parent_command:
+            targets.add(parent_pid)
+    return sorted(targets)
+
+
+def _schedule_termination(frontend_pids: list[int], backend_pids: list[int]):
+    unique_frontend = [pid for pid in dict.fromkeys(frontend_pids) if pid > 1]
+    unique_backend = [pid for pid in dict.fromkeys(backend_pids) if pid > 1]
+    current_pid = os.getpid()
+
+    def _worker():
+        time.sleep(0.35)
+        # 先に frontend / 親 uvicorn を停止し、最後に現在の backend プロセスを停止する。
+        ordered_targets = []
+        for pid in unique_frontend + unique_backend:
+            if pid == current_pid:
+                continue
+            if pid not in ordered_targets:
+                ordered_targets.append(pid)
+        for pid in ordered_targets:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                logger.exception("failed to terminate pid=%s", pid)
+
+        if current_pid in unique_backend:
+            try:
+                os.kill(current_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except Exception:
+                logger.exception("failed to terminate current backend pid=%s", current_pid)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 @app.post("/api/v1/test-mode/select-save-dir")
 def api_select_test_mode_save_dir():
     script = 'POSIX path of (choose folder with prompt "テストモード画像の保存先を選択")'
@@ -366,6 +461,19 @@ def api_select_test_mode_save_dir():
         "ok": True,
         "selected_dir": selected_dir,
         "default_dir": TEST_MODE_IMAGE_SAVE_ROOT,
+    }
+
+
+@app.post("/api/v1/app/shutdown")
+def api_shutdown_app():
+    frontend_pids = _collect_frontend_dev_pids()
+    backend_pids = _collect_backend_shutdown_pids()
+    _schedule_termination(frontend_pids, backend_pids)
+    return {
+        "ok": True,
+        "message": "shutdown requested",
+        "frontend_pids": frontend_pids,
+        "backend_pids": backend_pids,
     }
 
 

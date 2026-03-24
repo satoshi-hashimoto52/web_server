@@ -411,6 +411,7 @@ function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [connectionState, setConnectionState] = useState('idle');
   const [connectionMessage, setConnectionMessage] = useState('');
+  const [isShuttingDown, setIsShuttingDown] = useState(false);
   const [isCameraSidebarCollapsed, setIsCameraSidebarCollapsed] = useState(() => {
     try {
       return window.localStorage.getItem(CAMERA_SIDEBAR_COLLAPSED_KEY) === '1';
@@ -557,7 +558,7 @@ function App() {
       offsetY = 0;
     } else {
       drawWidth = rect.height * mediaRatio;
-      offsetX = (rect.width - drawWidth) / 2;
+      offsetX = 0;
     }
     setMediaRect({
       x: Math.max(0, offsetX),
@@ -622,6 +623,9 @@ function App() {
   };
   const activeCameraProfile = cameraProfiles.find((p) => p.id === activeCameraProfileId) || null;
   const activeCameraName = activeCameraProfile?.name || 'default';
+  const streamAspectRatio = sourceSize.width > 0 && sourceSize.height > 0
+    ? `${sourceSize.width} / ${sourceSize.height}`
+    : '16 / 9';
   const displayZoomPct = sourceSize.width > 0
     ? Math.max(1, Math.round((mediaRect.width / sourceSize.width) * 100))
     : 100;
@@ -1062,6 +1066,42 @@ function App() {
     latestImageDataRef.current = '';
     setImageData('');
     setIsStreaming(false);
+  };
+
+  const shutdownApplication = async () => {
+    if (isShuttingDown) return;
+    const confirmed = window.confirm('アプリを終了します。フロントエンドとバックエンドを停止しますか？');
+    if (!confirmed) return;
+
+    setIsShuttingDown(true);
+    try {
+      if (isStreaming) {
+        stopStream();
+      }
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 2200);
+      try {
+        await fetch(`${API_BASE_URL}/api/v1/app/shutdown`, {
+          method: 'POST',
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    } catch (error) {
+      console.warn('app shutdown request failed', error);
+    } finally {
+      window.setTimeout(() => {
+        try {
+          window.open('', '_self');
+          window.close();
+        } catch (_closeError) {
+          // no-op
+        }
+        window.location.replace('about:blank');
+      }, 120);
+      window.setTimeout(() => setIsShuttingDown(false), 2400);
+    }
   };
 
   const addRegion = () => {
@@ -1898,36 +1938,38 @@ function App() {
           <header className="hero">
             <div className="hero-layout">
               <div className="hero-copy">
-                <div className="hero-topline">
-                  <p className="eyebrow">Realtime Vision</p>
-                  <div className="tab-row">
-                    <button
-                      type="button"
-                      className={`tab-button ${activeTab === 'stream' ? 'active' : ''}`}
-                      onClick={() => setActiveTab('stream')}
-                    >
-                      Stream
-                    </button>
-                    <button
-                      type="button"
-                      className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`}
-                      onClick={() => setActiveTab('dashboard')}
-                    >
-                      Dashboard
-                    </button>
-                    <button
-                      type="button"
-                      className={`tab-button ${showSettingsDialog ? 'active' : ''}`}
-                      onClick={() => {
-                        setActiveSettingsTab('yolo');
-                        setShowSettingsDialog(true);
-                      }}
-                    >
-                      Setting
-                    </button>
+                <div className="title-line">
+                  <div className="hero-topline">
+                    <p className="eyebrow">Realtime Vision</p>
+                    <div className="tab-row">
+                      <button
+                        type="button"
+                        className={`tab-button ${activeTab === 'stream' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('stream')}
+                      >
+                        Stream
+                      </button>
+                      <button
+                        type="button"
+                        className={`tab-button ${activeTab === 'dashboard' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('dashboard')}
+                      >
+                        Dashboard
+                      </button>
+                      <button
+                        type="button"
+                        className={`tab-button ${showSettingsDialog ? 'active' : ''}`}
+                        onClick={() => {
+                          setActiveSettingsTab('yolo');
+                          setShowSettingsDialog(true);
+                        }}
+                      >
+                        Setting
+                      </button>
+                    </div>
                   </div>
+                  <h2>Live Stream Viewer</h2>
                 </div>
-                <h2>Live Stream Viewer</h2>
               </div>
             </div>
           </header>
@@ -1951,169 +1993,183 @@ function App() {
                     </button>
                   </div>
                 </div>
-                {!isCameraSidebarCollapsed && (
-                  <div className="camera-card-list">
-                    {cameraProfiles.map((profile) => {
-                      const isActiveProfile = profile.id === activeCameraProfileId;
-                      const summarySource = isActiveProfile ? sourceType : (profile.sourceType || 'url');
-                      const summaryDevice = summarySource === 'device'
-                        ? `device:${isActiveProfile ? deviceIndex : (profile.deviceIndex || '0')}`
-                        : (isActiveProfile ? (streamUrl || '-') : (profile.streamUrl || '-'));
-                      const summaryModel = isActiveProfile ? (selectedModel || '-') : (profile.model || '-');
-                      const summarySourceLabel = summarySource === 'device' ? 'デバイス' : 'URL';
-                      const summaryEndpointLabel = summarySource === 'device' ? 'デバイス' : 'ストリームURL';
-                      return (
-                        <article
-                          key={profile.id}
-                          className={`camera-card${isActiveProfile ? ' active' : ''}`}
-                        >
-                          <div className="camera-card-head">
-                            <button
-                              type="button"
-                              className="camera-card-summary"
-                              onClick={() => {
-                                setActiveCameraProfileId(profile.id);
-                                setShowCameraSettings(false);
-                              }}
-                            >
-                              <div className="camera-card-thumb">
-                                {isActiveProfile && isStreaming && streamingProfileId === profile.id && imageData ? (
-                                  <img src={imageData} alt={`${profile.name} preview`} />
-                                ) : (
-                                  <span>NO IMAGE</span>
-                                )}
-                              </div>
-                              <div className="camera-card-meta">
-                                <strong>{profile.name}</strong>
-                                <span>{isActiveProfile ? '選択中' : '未選択'}</span>
-                              </div>
-                            </button>
-                            <div className="camera-card-head-actions">
+                <div className="left-pane-body">
+                  {!isCameraSidebarCollapsed && (
+                    <div className="camera-card-list">
+                      {cameraProfiles.map((profile) => {
+                        const isActiveProfile = profile.id === activeCameraProfileId;
+                        const summarySource = isActiveProfile ? sourceType : (profile.sourceType || 'url');
+                        const summaryDevice = summarySource === 'device'
+                          ? `device:${isActiveProfile ? deviceIndex : (profile.deviceIndex || '0')}`
+                          : (isActiveProfile ? (streamUrl || '-') : (profile.streamUrl || '-'));
+                        const summaryModel = isActiveProfile ? (selectedModel || '-') : (profile.model || '-');
+                        const summarySourceLabel = summarySource === 'device' ? 'デバイス' : 'URL';
+                        const summaryEndpointLabel = summarySource === 'device' ? 'デバイス' : 'ストリームURL';
+                        return (
+                          <article
+                            key={profile.id}
+                            className={`camera-card${isActiveProfile ? ' active' : ''}`}
+                          >
+                            <div className="camera-card-head">
                               <button
                                 type="button"
-                                className="secondary camera-toggle"
+                                className="camera-card-summary"
                                 onClick={() => {
-                                  if (!isActiveProfile) {
-                                    setActiveCameraProfileId(profile.id);
-                                    setShowCameraSettings(true);
-                                    return;
-                                  }
-                                  setShowCameraSettings((prev) => !prev);
+                                  setActiveCameraProfileId(profile.id);
+                                  setShowCameraSettings(false);
                                 }}
                               >
-                                {isActiveProfile && showCameraSettings ? '閉' : '開'}
+                                <div className="camera-card-thumb">
+                                  {isActiveProfile && isStreaming && streamingProfileId === profile.id && imageData ? (
+                                    <img src={imageData} alt={`${profile.name} preview`} />
+                                  ) : (
+                                    <span>NO IMAGE</span>
+                                  )}
+                                </div>
+                                <div className="camera-card-meta">
+                                  <strong>{profile.name}</strong>
+                                  <span>{isActiveProfile ? '選択中' : '未選択'}</span>
+                                </div>
                               </button>
-                            </div>
-                          </div>
-                          {isActiveProfile && !showCameraSettings && (
-                            <div className="camera-card-summaryline">
-                              <div className="camera-card-titleline">
-                                <strong>{profile.name}</strong>
+                              <div className="camera-card-head-actions">
                                 <button
-                                  className={`primary camera-stream-toggle ${isStreaming ? 'danger' : ''}`}
                                   type="button"
-                                  onClick={() => (isStreaming ? stopStream() : startStream())}
-                                  disabled={connectionState === 'connecting' || connectionState === 'stopping'}
+                                  className="secondary camera-toggle"
+                                  onClick={() => {
+                                    if (!isActiveProfile) {
+                                      setActiveCameraProfileId(profile.id);
+                                      setShowCameraSettings(true);
+                                      return;
+                                    }
+                                    setShowCameraSettings((prev) => !prev);
+                                  }}
                                 >
-                                  {connectionState === 'connecting'
-                                    ? '接続中...'
-                                    : connectionState === 'stopping'
-                                      ? '停止中...'
-                                      : isStreaming
-                                        ? '停止'
-                                        : 'ストリーム'}
+                                  {isActiveProfile && showCameraSettings ? '閉' : '開'}
                                 </button>
                               </div>
-                              <span>入力ソース:{summarySourceLabel}</span>
-                              <span>{summaryEndpointLabel}:{summaryDevice}</span>
-                              <span>モデル:{summaryModel}</span>
                             </div>
-                          )}
-                          {isActiveProfile && showCameraSettings && (
-                            <div className="camera-card-body">
-                              <label className="field">
-                                <span>設定名</span>
-                                <input
-                                  type="text"
-                                  key={activeCameraProfileId}
-                                  defaultValue={activeCameraName}
-                                  onBlur={(e) => updateActiveCameraProfileName(e.target.value)}
-                                />
-                              </label>
-                              <label className="field">
-                                <span>入力ソース</span>
-                                <select
-                                  value={sourceType}
-                                  onChange={(e) => setSourceType(e.target.value)}
-                                >
-                                  <option value="url">HTTP/RTSP URL</option>
-                                  <option value="device">Macbook カメラ</option>
-                                </select>
-                              </label>
-                              {sourceType === 'url' ? (
+                            {isActiveProfile && !showCameraSettings && (
+                              <div className="camera-card-summaryline">
+                                <div className="camera-card-titleline">
+                                  <strong>{profile.name}</strong>
+                                  <button
+                                    className={`primary camera-stream-toggle ${isStreaming ? 'danger' : ''}`}
+                                    type="button"
+                                    onClick={() => (isStreaming ? stopStream() : startStream())}
+                                    disabled={connectionState === 'connecting' || connectionState === 'stopping'}
+                                  >
+                                    {connectionState === 'connecting'
+                                      ? '接続中...'
+                                      : connectionState === 'stopping'
+                                        ? '停止中...'
+                                        : isStreaming
+                                          ? '停止'
+                                          : 'ストリーム'}
+                                  </button>
+                                </div>
+                                <span>入力ソース:{summarySourceLabel}</span>
+                                <span>{summaryEndpointLabel}:{summaryDevice}</span>
+                                <span>モデル:{summaryModel}</span>
+                              </div>
+                            )}
+                            {isActiveProfile && showCameraSettings && (
+                              <div className="camera-card-body">
                                 <label className="field">
-                                  <span>ストリームURL</span>
+                                  <span>設定名</span>
                                   <input
                                     type="text"
-                                    value={streamUrl}
-                                    placeholder="http:// または rtsp://"
-                                    onChange={(e) => setStreamUrl(e.target.value)}
-                                    required
+                                    key={activeCameraProfileId}
+                                    defaultValue={activeCameraName}
+                                    onBlur={(e) => updateActiveCameraProfileName(e.target.value)}
                                   />
                                 </label>
-                              ) : (
                                 <label className="field">
-                                  <span>デバイス</span>
+                                  <span>入力ソース</span>
                                   <select
-                                    value={deviceIndex}
-                                    onChange={(e) => setDeviceIndex(e.target.value)}
+                                    value={sourceType}
+                                    onChange={(e) => setSourceType(e.target.value)}
                                   >
-                                    <option value="0">デバイス0（既定）</option>
-                                    <option value="1">デバイス1</option>
+                                    <option value="url">HTTP/RTSP URL</option>
+                                    <option value="device">Macbook カメラ</option>
                                   </select>
                                 </label>
-                              )}
-                              <label className="field">
-                                <span>モデル</span>
-                                <select
-                                  value={selectedModel}
-                                  onChange={(e) => setSelectedModel(e.target.value)}
-                                >
-                                  {modelOptions.length === 0 ? (
-                                    <option value="">読み込み中</option>
-                                  ) : (
-                                    modelOptions.map((name) => (
-                                      <option key={name} value={name}>{name}</option>
-                                    ))
-                                  )}
-                                </select>
-                              </label>
-                              <div className="camera-card-actions">
-                                <button
-                                  className="secondary"
-                                  type="button"
-                                  onClick={() => deleteCameraProfile(profile.id)}
-                                >
-                                  設定を削除
-                                </button>
+                                {sourceType === 'url' ? (
+                                  <label className="field">
+                                    <span>ストリームURL</span>
+                                    <input
+                                      type="text"
+                                      value={streamUrl}
+                                      placeholder="http:// または rtsp://"
+                                      onChange={(e) => setStreamUrl(e.target.value)}
+                                      required
+                                    />
+                                  </label>
+                                ) : (
+                                  <label className="field">
+                                    <span>デバイス</span>
+                                    <select
+                                      value={deviceIndex}
+                                      onChange={(e) => setDeviceIndex(e.target.value)}
+                                    >
+                                      <option value="0">デバイス0（既定）</option>
+                                      <option value="1">デバイス1</option>
+                                    </select>
+                                  </label>
+                                )}
+                                <label className="field">
+                                  <span>モデル</span>
+                                  <select
+                                    value={selectedModel}
+                                    onChange={(e) => setSelectedModel(e.target.value)}
+                                  >
+                                    {modelOptions.length === 0 ? (
+                                      <option value="">読み込み中</option>
+                                    ) : (
+                                      modelOptions.map((name) => (
+                                        <option key={name} value={name}>{name}</option>
+                                      ))
+                                    )}
+                                  </select>
+                                </label>
+                                <div className="camera-card-actions">
+                                  <button
+                                    className="secondary"
+                                    type="button"
+                                    onClick={() => deleteCameraProfile(profile.id)}
+                                  >
+                                    設定を削除
+                                  </button>
+                                </div>
+                                {(connectionState !== 'idle' || connectionMessage) && (
+                                  <p className={`muted connection-line state-${connectionState}`}>
+                                    状態: {connectionState}
+                                    {connectionMessage ? ` / ${connectionMessage}` : ''}
+                                  </p>
+                                )}
                               </div>
-                              {(connectionState !== 'idle' || connectionMessage) && (
-                                <p className={`muted connection-line state-${connectionState}`}>
-                                  状態: {connectionState}
-                                  {connectionMessage ? ` / ${connectionMessage}` : ''}
-                                </p>
-                              )}
-                            </div>
-                          )}
-                        </article>
-                      );
-                    })}
-                  </div>
-                )}
+                            )}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div className="left-pane-footer">
+                  <button
+                    className="primary danger sidebar-exit-button"
+                    type="button"
+                    onClick={shutdownApplication}
+                    disabled={isShuttingDown}
+                    aria-label="アプリ終了"
+                    title="フロントエンドとバックエンドを終了"
+                  >
+                    {isShuttingDown ? '終了中...' : (isCameraSidebarCollapsed ? '⏻' : 'アプリ終了')}
+                  </button>
+                </div>
               </aside>
               <div className={`preview${isCameraSidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
               <div className="stream-column">
-                <div className="video-shell">
+                <div className="video-shell" style={{ '--stream-aspect-ratio': streamAspectRatio }}>
                   <div
                     className={`stream-frame${showVideoSettings ? ' is-adjusting' : ' is-raw'}`}
                     ref={streamRef}
