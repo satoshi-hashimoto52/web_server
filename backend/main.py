@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 from uuid import uuid4
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -362,16 +362,35 @@ def _read_process_command(pid: int) -> str:
         return ""
 
 
-def _collect_frontend_dev_pids() -> list[int]:
+def _is_frontend_process_command(command: str) -> bool:
+    text = (command or "").lower()
+    if not text:
+        return False
+    frontend_dir = os.path.normpath(os.path.join(os.path.dirname(BASE_DIR), "frontend")).lower()
+    if frontend_dir in text:
+        return True
+    if "vite" in text:
+        return True
+    if "npm run dev" in text or "npm run preview" in text:
+        return True
+    return False
+
+
+def _collect_frontend_dev_pids(extra_ports: Optional[list[int]] = None) -> list[int]:
     candidates = []
     for raw in FRONTEND_DEV_PORTS.split(","):
         port_text = raw.strip()
         if not port_text.isdigit():
             continue
         candidates.append(int(port_text))
+    for port in extra_ports or []:
+        if isinstance(port, int) and 1 <= port <= 65535:
+            candidates.append(port)
+    candidates = sorted({port for port in candidates if 1 <= port <= 65535})
 
     detected = set()
     current_pid = os.getpid()
+    frontend_dir = os.path.normpath(os.path.join(os.path.dirname(BASE_DIR), "frontend")).lower()
     for port in candidates:
         try:
             proc = subprocess.run(
@@ -391,8 +410,37 @@ def _collect_frontend_dev_pids() -> list[int]:
             if pid <= 1 or pid == current_pid:
                 continue
             command = _read_process_command(pid).lower()
-            if "vite" in command or "npm run dev" in command or ("node" in command and "frontend" in command):
+            if _is_frontend_process_command(command):
                 detected.add(pid)
+
+    if detected:
+        return sorted(detected)
+
+    # ポート検出で拾えないケース（動的ポートや環境差異）向けフォールバック
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+    except Exception:
+        return []
+    for row in (proc.stdout or "").splitlines():
+        row = row.strip()
+        if not row:
+            continue
+        try:
+            pid_text, command = row.split(None, 1)
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid <= 1 or pid == current_pid:
+            continue
+        command_lower = (command or "").lower()
+        if frontend_dir in command_lower and _is_frontend_process_command(command_lower):
+            detected.add(pid)
     return sorted(detected)
 
 
@@ -411,6 +459,16 @@ def _schedule_termination(frontend_pids: list[int], backend_pids: list[int]):
     unique_frontend = [pid for pid in dict.fromkeys(frontend_pids) if pid > 1]
     unique_backend = [pid for pid in dict.fromkeys(backend_pids) if pid > 1]
     current_pid = os.getpid()
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+    def _is_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception:
+            return True
 
     def _worker():
         time.sleep(0.35)
@@ -428,6 +486,16 @@ def _schedule_termination(frontend_pids: list[int], backend_pids: list[int]):
                 continue
             except Exception:
                 logger.exception("failed to terminate pid=%s", pid)
+        time.sleep(0.55)
+        for pid in ordered_targets:
+            if not _is_alive(pid):
+                continue
+            try:
+                os.kill(pid, sigkill)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                logger.exception("failed to force-terminate pid=%s", pid)
 
         if current_pid in unique_backend:
             try:
@@ -436,6 +504,15 @@ def _schedule_termination(frontend_pids: list[int], backend_pids: list[int]):
                 return
             except Exception:
                 logger.exception("failed to terminate current backend pid=%s", current_pid)
+                return
+            time.sleep(0.25)
+            if _is_alive(current_pid):
+                try:
+                    os.kill(current_pid, sigkill)
+                except ProcessLookupError:
+                    return
+                except Exception:
+                    logger.exception("failed to force-terminate current backend pid=%s", current_pid)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -474,13 +551,24 @@ def api_select_test_mode_save_dir():
 
 
 @app.post("/api/v1/app/shutdown")
-def api_shutdown_app():
-    frontend_pids = _collect_frontend_dev_pids()
+def api_shutdown_app(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    requested_frontend_port = None
+    try:
+        requested_frontend_port = int((payload or {}).get("frontend_port"))
+    except (TypeError, ValueError):
+        requested_frontend_port = None
+    if requested_frontend_port is not None and not (1 <= requested_frontend_port <= 65535):
+        requested_frontend_port = None
+
+    frontend_pids = _collect_frontend_dev_pids(
+        extra_ports=[requested_frontend_port] if requested_frontend_port is not None else None
+    )
     backend_pids = _collect_backend_shutdown_pids()
     _schedule_termination(frontend_pids, backend_pids)
     return {
         "ok": True,
         "message": "shutdown requested",
+        "requested_frontend_port": requested_frontend_port,
         "frontend_pids": frontend_pids,
         "backend_pids": backend_pids,
     }
@@ -1057,15 +1145,21 @@ async def websocket_stream(websocket: WebSocket):
                     frame_for_infer = frame.copy()
 
             if should_run_inference:
-                infer_display_frame, detections = detect_objects(
-                    frame_for_infer,
-                    model_name,
-                    draw_overlay=show_inference_overlay,
-                    draw_model_label=show_inference_overlay,
-                    conf_threshold=confidence_threshold,
-                    nms_iou_threshold=nms_iou_threshold,
-                )
-                latest_detections = detections
+                try:
+                    infer_display_frame, detections = detect_objects(
+                        frame_for_infer,
+                        model_name,
+                        draw_overlay=show_inference_overlay,
+                        draw_model_label=show_inference_overlay,
+                        conf_threshold=confidence_threshold,
+                        nms_iou_threshold=nms_iou_threshold,
+                    )
+                    latest_detections = detections
+                except Exception as inference_error:
+                    await send_status("error", f"inference failed: {inference_error}")
+                    should_stop = True
+                    stop_reason = "inference failed"
+                    continue
             else:
                 detections = latest_detections
                 infer_display_frame = frame_for_infer

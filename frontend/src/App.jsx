@@ -1104,9 +1104,18 @@ function App() {
       }
       const controller = new AbortController();
       const timeoutId = window.setTimeout(() => controller.abort(), 2200);
+      const parsedPort = Number(window.location.port);
+      const frontendPort = Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : null;
       try {
         await fetch(`${API_BASE_URL}/api/v1/app/shutdown`, {
           method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            frontend_port: frontendPort,
+          }),
+          keepalive: true,
           signal: controller.signal,
         });
       } finally {

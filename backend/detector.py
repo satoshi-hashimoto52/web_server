@@ -8,6 +8,7 @@ from ultralytics import YOLO
 import os
 import torch
 from glob import glob
+import ultralytics.utils.loss as ultralytics_loss
 
 # モデルを一度だけロード
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +50,12 @@ else:
     device = 'cpu'
 
 _model_cache = {}
+
+
+# 古い重みが参照する E2ELoss は新しい ultralytics では E2EDetectLoss に改名されているため、
+# 後方互換のエイリアスを補う。
+if not hasattr(ultralytics_loss, "E2ELoss") and hasattr(ultralytics_loss, "E2EDetectLoss"):
+    ultralytics_loss.E2ELoss = ultralytics_loss.E2EDetectLoss
 
 def _iou(a, b):
     ax1, ay1, ax2, ay2 = a
