@@ -62,6 +62,7 @@ ALERT_SUPPRESS_MINUTES = 5
 STREAM_TARGET_FPS = 20.0
 STREAM_READ_RETRY_LIMIT = 20
 DEFAULT_DETECTION_CONFIDENCE_THRESHOLD = 0.25
+DEFAULT_NMS_IOU_THRESHOLD = 0.55
 DEFAULT_RESULT_INTERVAL_FRAMES = 1
 DEFAULT_MERGE_SAME_DIGITS = True
 DEFAULT_MERGE_ROW_TOLERANCE = 0.5
@@ -244,6 +245,7 @@ def _to_bool(value: Any, default: bool = False) -> bool:
 def _default_detection_settings() -> Dict[str, Any]:
     return {
         "confidence_threshold": DEFAULT_DETECTION_CONFIDENCE_THRESHOLD,
+        "nms_iou_threshold": DEFAULT_NMS_IOU_THRESHOLD,
         "result_interval_frames": DEFAULT_RESULT_INTERVAL_FRAMES,
         "merge_same_digits": DEFAULT_MERGE_SAME_DIGITS,
         "merge_row_tolerance": DEFAULT_MERGE_ROW_TOLERANCE,
@@ -257,6 +259,10 @@ def _sanitize_detection_settings(payload: Dict[str, Any], fallback: Optional[Dic
     confidence_threshold = _to_float(
         payload.get("confidenceThreshold", payload.get("confidence_threshold", base["confidence_threshold"])),
         "detectionSettings.confidenceThreshold",
+    )
+    nms_iou_threshold = _to_float(
+        payload.get("nmsIouThreshold", payload.get("nms_iou_threshold", base["nms_iou_threshold"])),
+        "detectionSettings.nmsIouThreshold",
     )
     result_interval_frames = _to_int(
         payload.get("resultIntervalFrames", payload.get("result_interval_frames", base["result_interval_frames"])),
@@ -274,6 +280,8 @@ def _sanitize_detection_settings(payload: Dict[str, Any], fallback: Optional[Dic
 
     if not 0.01 <= confidence_threshold <= 0.99:
         raise HTTPException(status_code=400, detail="invalid detectionSettings: confidenceThreshold")
+    if not 0.1 <= nms_iou_threshold <= 0.95:
+        raise HTTPException(status_code=400, detail="invalid detectionSettings: nmsIouThreshold")
     if not 1 <= result_interval_frames <= 60:
         raise HTTPException(status_code=400, detail="invalid detectionSettings: resultIntervalFrames")
     if not 0.05 <= merge_row_tolerance <= 2.0:
@@ -283,6 +291,7 @@ def _sanitize_detection_settings(payload: Dict[str, Any], fallback: Optional[Dic
 
     return {
         "confidence_threshold": _clamp(confidence_threshold, 0.01, 0.99),
+        "nms_iou_threshold": _clamp(nms_iou_threshold, 0.1, 0.95),
         "result_interval_frames": int(_clamp(float(result_interval_frames), 1.0, 60.0)),
         "merge_same_digits": merge_same_digits,
         "merge_row_tolerance": _clamp(merge_row_tolerance, 0.05, 2.0),
@@ -1032,6 +1041,7 @@ async def websocket_stream(websocket: WebSocket):
             # 物体検出（推論入力は preprocess 適用可）
             frame_seq += 1
             confidence_threshold = float(detection_settings.get("confidence_threshold", DEFAULT_DETECTION_CONFIDENCE_THRESHOLD))
+            nms_iou_threshold = float(detection_settings.get("nms_iou_threshold", DEFAULT_NMS_IOU_THRESHOLD))
             result_interval_frames = int(detection_settings.get("result_interval_frames", DEFAULT_RESULT_INTERVAL_FRAMES))
             merge_same_digits = bool(detection_settings.get("merge_same_digits", DEFAULT_MERGE_SAME_DIGITS))
             merge_row_tolerance = float(detection_settings.get("merge_row_tolerance", DEFAULT_MERGE_ROW_TOLERANCE))
@@ -1053,6 +1063,7 @@ async def websocket_stream(websocket: WebSocket):
                     draw_overlay=show_inference_overlay,
                     draw_model_label=show_inference_overlay,
                     conf_threshold=confidence_threshold,
+                    nms_iou_threshold=nms_iou_threshold,
                 )
                 latest_detections = detections
             else:

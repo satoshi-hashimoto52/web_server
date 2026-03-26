@@ -113,6 +113,7 @@ def detect_objects(
     draw_overlay=True,
     draw_model_label=True,
     conf_threshold: float = 0.25,
+    nms_iou_threshold: float = 0.55,
 ):
     """
     フレームに対して YOLOv8 で物体検出を行い、
@@ -141,7 +142,7 @@ def detect_objects(
         })
         # バウンディングボックス
     # 重なりが大きい検出は確信度の高い方のみ残す
-    detections = _nms(detections, iou_threshold=0.75)
+    detections = _nms(detections, iou_threshold=float(max(0.05, min(nms_iou_threshold, 0.95))))
 
     if draw_overlay:
         for det in detections:

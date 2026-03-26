@@ -314,6 +314,7 @@ def infer(
 
     detection = detection_settings or {}
     confidence_threshold = max(0.0, min(float(detection.get("confidence_threshold", 0.25)), 1.0))
+    nms_iou_threshold = max(0.1, min(float(detection.get("nms_iou_threshold", 0.55)), 0.95))
     merge_same_digits = bool(detection.get("merge_same_digits", True))
     merge_row_tolerance = float(detection.get("merge_row_tolerance", 0.5))
     merge_x_gap_ratio = float(detection.get("merge_x_gap_ratio", 0.35))
@@ -322,6 +323,7 @@ def infer(
         frame,
         model_name or MODEL_FILENAME,
         conf_threshold=confidence_threshold,
+        nms_iou_threshold=nms_iou_threshold,
     )
     value_text, debug_info = build_meter_value(
         detections,
@@ -347,6 +349,7 @@ def infer(
             "detection_count": len(detections),
             "dedup_detection_count": int(debug_info.get("dedup_count", 0)),
             "confidence_threshold": confidence_threshold,
+            "nms_iou_threshold": nms_iou_threshold,
             "merge_same_digits": merge_same_digits,
         },
     }

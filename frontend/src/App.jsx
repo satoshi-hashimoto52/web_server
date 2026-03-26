@@ -50,6 +50,7 @@ const DEFAULT_VIDEO_SETTINGS = Object.freeze({
 });
 const DEFAULT_DETECTION_SETTINGS = Object.freeze({
   confidenceThreshold: 0.25,
+  nmsIouThreshold: 0.55,
   resultIntervalFrames: 1,
   mergeSameDigits: true,
   mergeSameDigitsRowTolerance: 0.5,
@@ -124,6 +125,11 @@ const sanitizeDetectionSettings = (value) => {
       0.01,
       0.99,
     ),
+    nmsIouThreshold: clampNumber(
+      asNumber(input.nmsIouThreshold ?? input.nms_iou_threshold, DEFAULT_DETECTION_SETTINGS.nmsIouThreshold),
+      0.1,
+      0.95,
+    ),
     resultIntervalFrames: clampNumber(
       Math.round(asNumber(input.resultIntervalFrames ?? input.result_interval_frames, DEFAULT_DETECTION_SETTINGS.resultIntervalFrames)),
       1,
@@ -145,6 +151,7 @@ const sanitizeDetectionSettings = (value) => {
 
 const toDetectionSettingsPayload = (settings) => ({
   confidenceThreshold: settings.confidenceThreshold,
+  nmsIouThreshold: settings.nmsIouThreshold,
   resultIntervalFrames: settings.resultIntervalFrames,
   mergeSameDigits: settings.mergeSameDigits,
   mergeSameDigitsRowTolerance: settings.mergeSameDigitsRowTolerance,
@@ -2576,6 +2583,18 @@ function App() {
                           onChange={(event) => updateDetectionSetting('resultIntervalFrames', Number(event.target.value))}
                         />
                         <strong className="setting-value">{Math.round(detectionSettings.resultIntervalFrames)}f</strong>
+                      </label>
+                      <label className="setting-row setting-row--stacked">
+                        <span>NMS IoU（重複抑制）</span>
+                        <input
+                          type="range"
+                          min="0.10"
+                          max="0.95"
+                          step="0.01"
+                          value={detectionSettings.nmsIouThreshold}
+                          onChange={(event) => updateDetectionSetting('nmsIouThreshold', Number(event.target.value))}
+                        />
+                        <strong className="setting-value">{detectionSettings.nmsIouThreshold.toFixed(2)}</strong>
                       </label>
                       <label className="setting-checkbox">
                         <input
