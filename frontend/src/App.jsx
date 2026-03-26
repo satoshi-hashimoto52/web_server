@@ -458,6 +458,7 @@ function App() {
   const latestImageDataRef = useRef('');
   const streamRef = useRef(null);
   const streamCanvasRef = useRef(null);
+  const videoShellRef = useRef(null);
   const sourceImageRef = useRef(null);
   const regionLayerRef = useRef(null);
   const dragRef = useRef(null);
@@ -491,6 +492,8 @@ function App() {
   const fpsEmaRef = useRef(0);
   const [mediaRect, setMediaRect] = useState({ x: 0, y: 0, width: 0, height: 0 });
   const [streamingProfileId, setStreamingProfileId] = useState('');
+  const [videoShellHeight, setVideoShellHeight] = useState(0);
+  const profileHydratingRef = useRef('');
 
   const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
   const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -543,7 +546,12 @@ function App() {
     const sourceWidth = image?.naturalWidth || canvas?.width || 0;
     const sourceHeight = image?.naturalHeight || canvas?.height || 0;
     if (!sourceWidth || !sourceHeight) {
-      setMediaRect({ x: 0, y: 0, width: rect.width, height: rect.height });
+      const last = frameSizeRef.current;
+      if (last.width > 0 && last.height > 0) {
+        setMediaRect({ x: 0, y: 0, width: last.width, height: last.height });
+      } else {
+        setMediaRect({ x: 0, y: 0, width: 0, height: 0 });
+      }
       return;
     }
 
@@ -1028,6 +1036,9 @@ function App() {
 
   useEffect(() => {
     if (!activeCameraProfile) return;
+    frameSizeRef.current = { width: 0, height: 0 };
+    setMediaRect({ x: 0, y: 0, width: 0, height: 0 });
+    profileHydratingRef.current = activeCameraProfile.id;
     setSourceType(activeCameraProfile.sourceType);
     setStreamUrl(activeCameraProfile.streamUrl);
     setDeviceIndex(activeCameraProfile.deviceIndex);
@@ -1035,6 +1046,12 @@ function App() {
     setVideoSettings(sanitizeVideoSettings(activeCameraProfile.videoSettings));
     setDetectionSettings(sanitizeDetectionSettings(activeCameraProfile.detectionSettings));
     setSelectedModel(activeCameraProfile.model || modelOptions[0] || '');
+    const timer = window.setTimeout(() => {
+      if (profileHydratingRef.current === activeCameraProfile.id) {
+        profileHydratingRef.current = '';
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [activeCameraProfileId, modelOptions]);
 
   const stopStream = () => {
@@ -1195,7 +1212,21 @@ function App() {
   };
 
   const resetVideoSettings = () => {
-    setVideoSettings(DEFAULT_VIDEO_SETTINGS);
+    setVideoSettings(sanitizeVideoSettings(DEFAULT_VIDEO_SETTINGS));
+  };
+
+  const resetDetectionSettings = () => {
+    const nextSettings = sanitizeDetectionSettings(DEFAULT_DETECTION_SETTINGS);
+    setDetectionSettings(nextSettings);
+    if (!activeCameraProfileId) return;
+    setCameraProfiles((prev) => prev.map((profile) => (
+      profile.id === activeCameraProfileId
+        ? {
+            ...profile,
+            detectionSettings: nextSettings,
+          }
+        : profile
+    )));
   };
 
   const createCameraProfile = () => {
@@ -1629,6 +1660,7 @@ function App() {
   useEffect(() => {
     if (!activeCameraProfileId) return;
     if (activeAction) return;
+    if (profileHydratingRef.current === activeCameraProfileId) return;
     setCameraProfiles((prev) => prev.map((profile) => (
       profile.id === activeCameraProfileId
         ? {
@@ -1759,6 +1791,26 @@ function App() {
   useEffect(() => {
     computeMediaRect();
   }, [imageData, activeTab, computeMediaRect]);
+
+  useEffect(() => {
+    if (activeTab !== 'stream') return undefined;
+    const node = videoShellRef.current;
+    if (!node) return undefined;
+    const updateHeight = (nextHeight) => {
+      const rounded = Math.max(0, Math.round(nextHeight));
+      setVideoShellHeight((prev) => (Math.abs(prev - rounded) <= 1 ? prev : rounded));
+    };
+    updateHeight(node.getBoundingClientRect().height || 0);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      updateHeight(entry.contentRect.height || 0);
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [activeTab, streamAspectRatio]);
 
   useEffect(() => {
     if (activeTab !== 'stream') return undefined;
@@ -2167,9 +2219,16 @@ function App() {
                   </button>
                 </div>
               </aside>
-              <div className={`preview${isCameraSidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+              <div
+                className={`preview${isCameraSidebarCollapsed ? ' sidebar-collapsed' : ''}`}
+                style={{ '--video-shell-height': videoShellHeight > 0 ? `${videoShellHeight}px` : undefined }}
+              >
               <div className="stream-column">
-                <div className="video-shell" style={{ '--stream-aspect-ratio': streamAspectRatio }}>
+                <div
+                  ref={videoShellRef}
+                  className="video-shell"
+                  style={{ '--stream-aspect-ratio': streamAspectRatio }}
+                >
                   <div
                     className={`stream-frame${showVideoSettings ? ' is-adjusting' : ' is-raw'}`}
                     ref={streamRef}
@@ -2487,7 +2546,12 @@ function App() {
               <div className="settings-dialog-body">
                 {activeSettingsTab === 'yolo' && (
                   <div className="settings-tab-panel">
-                    <h4>YOLO検出設定</h4>
+                    <div className="video-settings-header">
+                      <h4>YOLO検出設定</h4>
+                      <button className="secondary" type="button" onClick={resetDetectionSettings}>
+                        Reset
+                      </button>
+                    </div>
                     <div className="setting-details-body">
                       <label className="setting-row setting-row--stacked">
                         <span>検出確信度（閾値）</span>

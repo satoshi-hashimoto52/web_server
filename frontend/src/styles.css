@@ -768,6 +768,7 @@ select {
   border: 1px solid rgba(255, 255, 255, 0.08);
   padding: 12px;
   min-height: 0;
+  height: 100%;
 }
 
 .side-column {
@@ -789,8 +790,9 @@ select {
   gap: 10px;
   min-width: 0;
   min-height: 0;
-  max-height: 100%;
-  overflow-y: auto;
+  height: var(--video-shell-height, auto);
+  max-height: var(--video-shell-height, 100%);
+  overflow-y: hidden;
   padding-right: 6px;
   width: 100%;
   max-width: 100%;
@@ -1037,6 +1039,10 @@ select {
   border-radius: 10px;
   background: rgba(24, 34, 56, 0.36);
   padding: 8px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
 }
 
 .results-section summary {
@@ -1058,7 +1064,9 @@ select {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 220px;
+  max-height: none;
+  min-height: 0;
+  flex: 1 1 auto;
   overflow: auto;
 }
 
@@ -1281,6 +1289,7 @@ select {
   }
 
   .right-pane {
+    height: auto;
     max-height: none;
     overflow: visible;
     padding-right: 0;
